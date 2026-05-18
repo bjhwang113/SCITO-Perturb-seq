@@ -1,0 +1,663 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+Parallel Correlation Comparison: Semi-NMF Modules vs A Priori Linked
+Proteins Against External CRISPR Screens
+
+<<>>=
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(readxl)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(gridExtra)
+})
+
+set.seed(42)
+
+INPUT_DIR        <- "/home/ec2-user/scitoseq/results/semiNMF_v1_analysis"
+GENE_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+DATA_DIR         <- "/home/ec2-user/scitoseq/data"
+OUTPUT_DIR       <- "/home/ec2-user/scitoseq/fig/fig3"
+
+path_schmidt  <- "/mnt/my-data/scito-perturb-seq-internal/scitoseq/Pipes/logs/external/schmidt_et_al.xlsx"
+sheet_schmidt <- "Prim.CRa.CD4.IL2.gene_summary"
+path_belk     <- "/mnt/my-data/scito-perturb-seq-internal/scitoseq/Pipes/logs/external/belk_et_al.xlsx"
+sheet_belk    <- "genomewide_results"
+path_shifrut  <- "/mnt/my-data/scito-perturb-seq-internal/scitoseq/Pipes/logs/external/shifrut_et_al.xlsx"
+sheet_shifrut <- "PrimaryScreen_Rep1_Gene"
+path_arce     <- file.path(DATA_DIR, "ARCE_2023-10-17819C-S1_all_screens_results.xlsx")
+
+my_q_thres   <- 0.1
+FIXED_N      <- 50
+MIN_GENES    <- 15
+N_SWEEP      <- seq(20, 300, by = 10)
+@
+
+<<>>=
+## SECTION 1: Load semi-NMF W matrix (L2-normalized)
+model_k5 <- readRDS(file.path(INPUT_DIR, "model_k5.rds"))
+W_raw <- model_k5$W
+H_raw <- model_k5$H
+
+modules <- paste0("M", 1:5)
+colnames(W_raw) <- modules
+rownames(H_raw) <- modules
+
+d <- sqrt(colSums(W_raw^2))
+W <- sweep(W_raw, 2, d, "/")
+H <- diag(d) %*% H_raw
+rownames(H) <- modules
+colnames(H) <- colnames(H_raw)
+
+cat(sprintf("W: %d genes x %d modules (L2-normalized)\n", nrow(W), ncol(W)))
+# W: 2848 genes x 5 modules (L2-normalized)
+
+## SECTION 2: Load gene-level Z-scores and significance
+gene_zscore_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_zscore_mat.rds"))
+gene_qval_per_protein <- readRDS(file.path(GENE_RESULTS_DIR, "gene_qval_per_protein.rds"))
+
+cat(sprintf("Z-score matrix: %d genes x %d proteins\n",
+            nrow(gene_zscore_mat), ncol(gene_zscore_mat)))
+# Z-score matrix: 2848 genes x 201 proteins
+
+## Align gene universes
+common_genes <- Reduce(intersect, list(
+  rownames(W), rownames(gene_qval_per_protein), rownames(gene_zscore_mat)))
+W <- W[common_genes, , drop = FALSE]
+gene_qval_per_protein <- gene_qval_per_protein[common_genes, , drop = FALSE]
+gene_zscore_mat <- gene_zscore_mat[common_genes, , drop = FALSE]
+
+## Significant genes
+q_min <- apply(gene_qval_per_protein, 1L, function(x) {
+  fv <- x[is.finite(x)]
+  if (length(fv) == 0) return(Inf)
+  min(fv)
+})
+genes_my_sig <- names(q_min)[is.finite(q_min) & q_min <= my_q_thres]
+cat(sprintf("Significant genes (min q <= %.2f): %d\n", my_q_thres, length(genes_my_sig)))
+# Significant genes (min q <= 0.10): 2848
+@
+
+<<>>=
+## SECTION 3: Load external screens (NO FDR filtering)
+## Schmidt IL-2 (CRISPRa, no sign flip)
+schmidt_ref <- read_excel(path_schmidt, sheet = sheet_schmidt) %>%
+  transmute(
+    Gene = id,
+    lfc  = `pos|lfc`,
+    fdr  = pmin(`pos|fdr`, `neg|fdr`, na.rm = TRUE)
+  ) %>%
+  filter(!is.na(Gene), is.finite(lfc), is.finite(fdr))
+cat(sprintf("Schmidt IL-2 (all): %d genes\n", nrow(schmidt_ref)))
+# Schmidt IL-2 (all): 18930 genes
+
+## Belk exhaustion (CRISPRko, no sign flip)
+belk_ref <- read_excel(path_belk, sheet = sheet_belk) %>%
+  transmute(Gene = Gene, lfc = lfc_mageck, fdr = fdr_mageck) %>%
+  filter(!is.na(Gene), is.finite(lfc), is.finite(fdr))
+cat(sprintf("Belk exhaustion (all): %d genes\n", nrow(belk_ref)))
+# Belk exhaustion (all): 17447 genes
+
+## Shifrut proliferation (CRISPRko, sign flip: lfc = -pos|lfc)
+shifrut_ref <- read_excel(path_shifrut, sheet = sheet_shifrut) %>%
+  transmute(
+    Gene = id,
+    lfc  = -`pos|lfc`,
+    fdr  = pmin(`pos|fdr`, `neg|fdr`, na.rm = TRUE)
+  ) %>%
+  filter(!is.na(Gene), is.finite(lfc), is.finite(fdr))
+cat(sprintf("Shifrut proliferation (all): %d genes (sign-flipped)\n", nrow(shifrut_ref)))
+# Shifrut proliferation (all): 19114 genes (sign-flipped)
+
+## Arce IL2RA, Stimulated_Teff (CRISPRko, sign flip: lfc = -neg|lfc)
+arce_ref <- read_excel(path_arce, sheet = "gene_summary") %>%
+  transmute(
+    Gene    = id,
+    lfc_raw = `neg|lfc.Stimulated_Teff`,
+    fdr_neg = `neg|fdr.Stimulated_Teff`,
+    fdr_pos = `pos|fdr.Stimulated_Teff`
+  ) %>% mutate(
+    fdr = ifelse(lfc_raw > 0, fdr_pos, ifelse(lfc_raw < 0, fdr_neg, NA)),
+    lfc = -lfc_raw) %>%
+  filter(!is.na(Gene), is.finite(lfc), is.finite(fdr)) %>%
+  dplyr::select(Gene, lfc, fdr)
+cat(sprintf("Arce IL2RA (all): %d genes (sign-flipped)\n", nrow(arce_ref)))
+# Arce IL2RA (all): 1350 genes (sign-flipped)
+
+screen_list <- list(
+  Belk_exhaust   = belk_ref,
+  Shifrut_prolif = shifrut_ref,
+  Schmidt_IL2    = schmidt_ref,
+  Arce_IL2RA     = arce_ref
+)
+@
+
+<<>>=
+## SECTION 4: Fixed-N gene selection
+select_top_n <- function(ref_df, sig_genes, n) {
+  shared <- ref_df %>%
+    filter(Gene %in% sig_genes) %>%
+    arrange(fdr) %>%
+    distinct(Gene, .keep_all = TRUE)
+  actual_n <- min(n, nrow(shared))
+  list(
+    genes     = shared$Gene[seq_len(actual_n)],
+    actual_n  = actual_n,
+    max_avail = nrow(shared)
+  )
+}
+
+cat("\n=== Gene overlap diagnostics ===\n")
+for (s in names(screen_list)) {
+  ref_df <- screen_list[[s]]
+  shared <- ref_df %>% filter(Gene %in% genes_my_sig)
+  cat(sprintf("  %s: %d total genes in screen, %d overlap with SCITO sig set\n",
+              s, nrow(ref_df), nrow(shared)))
+}
+@
+
+Belk_exhaust: 17447 total genes in screen, 2263 overlap with SCITO sig set
+Shifrut_prolif: 19114 total genes in screen, 2793 overlap with SCITO sig set
+Schmidt_IL2: 18930 total genes in screen, 2848 overlap with SCITO sig set
+Arce_IL2RA: 1350 total genes in screen, 226 overlap with SCITO sig set
+
+<<>>=
+## SECTION 5: Biologically linked proteins (a priori)
+
+linked_proteins <- c(
+  Belk_exhaust   = "CD279",
+  Shifrut_prolif = "CD71",
+  Schmidt_IL2    = "CD25",
+  Arce_IL2RA     = "CD25"
+)
+
+available_prots <- colnames(gene_zscore_mat)
+for (s in names(linked_proteins)) {
+  p <- linked_proteins[s]
+  if (p %in% available_prots) {
+    cat(sprintf("  %s -> %s [found]\n", s, p))
+  } else {
+    cat(sprintf("  %s -> %s [NOT FOUND in panel]\n", s, p))
+    if (p == "CD71" && "CD98" %in% available_prots) {
+      linked_proteins[s] <- "CD98"
+      cat(sprintf("    -> falling back to CD98 (amino acid transporter, proliferation-linked)\n"))
+    } else if (p == "CD71" && "CD25" %in% available_prots) {
+      linked_proteins[s] <- "CD25"
+      cat(sprintf("    -> falling back to CD25 (activation/proliferation proxy)\n"))
+    }
+  }
+}
+cat("\nFinal mapping:\n")
+print(linked_proteins)
+@
+  Belk_exhaust Shifrut_prolif    Schmidt_IL2     Arce_IL2RA 
+       "CD279"         "CD71"         "CD25"         "CD25" 
+       
+<<>>=
+## SECTION 6: Core correlation functions
+cor_repr_vs_screen <- function(repr_mat, ref_df, gene_set) {
+  ref_vec <- ref_df$lfc[match(gene_set, ref_df$Gene)]
+  sub_mat <- repr_mat[gene_set, , drop = FALSE]
+  apply(sub_mat, 2, function(col) {
+    ok <- is.finite(col) & is.finite(ref_vec)
+    if (sum(ok) < MIN_GENES) return(NA_real_)
+    cor(col[ok], ref_vec[ok], method = "pearson")
+  })
+}
+
+cor_single_protein <- function(zscore_mat, ref_df, gene_set, protein) {
+  ref_vec <- ref_df$lfc[match(gene_set, ref_df$Gene)]
+  prot_vec <- zscore_mat[gene_set, protein]
+  ok <- is.finite(prot_vec) & is.finite(ref_vec)
+  if (sum(ok) < MIN_GENES) return(NA_real_)
+  cor(prot_vec[ok], ref_vec[ok], method = "pearson")
+}
+
+cor_all_proteins <- function(zscore_mat, ref_df, gene_set) {
+  ref_vec <- ref_df$lfc[match(gene_set, ref_df$Gene)]
+  sub_mat <- zscore_mat[gene_set, , drop = FALSE]
+  apply(sub_mat, 2, function(col) {
+    ok <- is.finite(col) & is.finite(ref_vec)
+    if (sum(ok) < MIN_GENES) return(NA_real_)
+    cor(col[ok], ref_vec[ok], method = "pearson")
+  })
+}
+@
+
+<<>>=
+## SECTION 7: Run correlations at fixed N (4 screens)
+screen_order <- c("Belk_exhaust", "Shifrut_prolif",
+                  "Schmidt_IL2", "Arce_IL2RA")
+
+cat(sprintf("\n=== Running correlations at fixed N = %d ===\n\n", FIXED_N))
+
+results_nmf      <- list()
+results_linked   <- list()
+results_all_prot <- list()
+overlap_info     <- list()
+
+for (s in screen_order) {
+  ref_df <- screen_list[[s]]
+  sel <- select_top_n(ref_df, genes_my_sig, FIXED_N)
+  gene_set <- sel$genes
+  gene_set <- Reduce(intersect, list(
+    gene_set, rownames(W), rownames(gene_zscore_mat)))
+
+  overlap_info[[s]] <- list(
+    n_used    = length(gene_set),
+    n_avail   = sel$max_avail,
+    requested = FIXED_N
+  )
+
+  cat(sprintf("[%s] requested=%d, available=%d, used=%d\n",
+              s, FIXED_N, sel$max_avail, length(gene_set)))
+
+  ## NMF modules (with p-values)
+  ref_vec <- ref_df$lfc[match(gene_set, ref_df$Gene)]
+  W_sub <- W[gene_set, , drop = FALSE]
+  cor_r <- cor_p <- setNames(rep(NA_real_, ncol(W_sub)), colnames(W_sub))
+  for (m in colnames(W_sub)) {
+    x <- W_sub[, m]; y <- ref_vec
+    ok <- is.finite(x) & is.finite(y)
+    if (sum(ok) < MIN_GENES) next
+    ct <- cor.test(x[ok], y[ok], method = "pearson")
+    cor_r[m] <- ct$estimate
+    cor_p[m] <- ct$p.value
+  }
+  results_nmf[[s]] <- list(r = cor_r, p = cor_p)
+
+  ## Linked protein
+  results_linked[[s]] <- cor_single_protein(
+    gene_zscore_mat, ref_df, gene_set, linked_proteins[s])
+
+  ## All individual proteins (for distribution plot)
+  results_all_prot[[s]] <- cor_all_proteins(gene_zscore_mat, ref_df, gene_set)
+}
+@
+[Belk_exhaust] requested=50, available=2263, used=50
+[Shifrut_prolif] requested=50, available=2793, used=50
+[Schmidt_IL2] requested=50, available=2848, used=50
+[Arce_IL2RA] requested=50, available=226, used=50
+
+<<>>=
+## SECTION 8: Summary
+cat("\n=== Summary at fixed N ===\n\n")
+
+for (s in screen_order) {
+  info <- overlap_info[[s]]
+  cat(sprintf("--- %s (n_used = %d, n_avail = %d) ---\n",
+              s, info$n_used, info$n_avail))
+
+  cat("  NMF modules:       ")
+  cat(paste(sprintf("%s=%.3f", names(results_nmf[[s]]$r), results_nmf[[s]]$r),
+            collapse = "  "))
+  nmf_peak <- which.max(abs(results_nmf[[s]]$r))
+  cat(sprintf("  [peak: %s, r=%.3f]\n",
+              names(results_nmf[[s]]$r)[nmf_peak],
+              results_nmf[[s]]$r[nmf_peak]))
+
+  cat(sprintf("  Linked protein:    %s (r=%.3f)\n",
+              linked_proteins[s], results_linked[[s]]))
+  cat("\n")
+}
+@
+
+--- Belk_exhaust (n_used = 50, n_avail = 2263) ---
+  NMF modules:       M1=0.070  M2=-0.106  M3=-0.200  M4=0.004  M5=0.202  [peak: M5, r=0.202]
+  Linked protein:    CD279 (r=0.061)
+
+--- Shifrut_prolif (n_used = 50, n_avail = 2793) ---
+  NMF modules:       M1=0.182  M2=0.170  M3=-0.427  M4=0.361  M5=0.079  [peak: M3, r=-0.427]
+  Linked protein:    CD71 (r=0.351)
+
+--- Schmidt_IL2 (n_used = 50, n_avail = 2848) ---
+  NMF modules:       M1=0.045  M2=0.085  M3=-0.089  M4=0.005  M5=0.152  [peak: M5, r=0.152]
+  Linked protein:    CD25 (r=-0.100)
+
+--- Arce_IL2RA (n_used = 50, n_avail = 226) ---
+  NMF modules:       M1=-0.063  M2=0.023  M3=0.017  M4=-0.011  M5=-0.092  [peak: M5, r=-0.092]
+  Linked protein:    CD25 (r=-0.411)
+  
+<<>>=
+## SECTION 9: Two-panel heatmap (NMF modules + a priori protein)
+
+## --- Shared definitions ---
+module_names <- c(
+  "M1" = "Adhesion /\nRegulation",
+  "M2" = "Tissue /\nInnate-like",
+  "M3" = "Resting /\nNaive",
+  "M4" = "Activation /\nProliferation",
+  "M5" = "Effector /\nExhaustion"
+)
+
+module_colors <- c(
+  "M1" = "#da7901",
+  "M2" = "#20235b",
+  "M3" = "#637b31",
+  "M4" = "#7B2D8E",
+  "M5" = "#f0be3d"
+)
+
+screen_labels <- c(
+  Belk_exhaust   = "Belk\nExhaustion",
+  Shifrut_prolif = "Shifrut\nProliferation",
+  Schmidt_IL2    = "Schmidt\nIL-2 cytokine",
+  Arce_IL2RA     = "Arce\nIL2RA protein"
+)
+
+readout_type_colors <- c(
+  "Composite cellular\nphenotype" = "#2C3E50",
+  "Single-molecule\nreadout"      = "#BDC3C7"
+)
+
+screen_readout <- c(
+  Belk_exhaust   = "Composite cellular\nphenotype",
+  Shifrut_prolif = "Composite cellular\nphenotype",
+  Schmidt_IL2    = "Single-molecule\nreadout",
+  Arce_IL2RA     = "Single-molecule\nreadout"
+)
+
+## Highlighted cells (biologically expected key pairs)
+highlight_pairs <- list(
+  c("Belk_exhaust",   "M5"),
+  c("Shifrut_prolif", "M4"),
+  c("Shifrut_prolif", "M3")
+)
+
+## --- Build NMF correlation matrix ---
+cor_mat_nmf <- do.call(rbind, lapply(screen_order, function(s) results_nmf[[s]]$r))
+rownames(cor_mat_nmf) <- screen_order
+
+pval_mat_nmf <- do.call(rbind, lapply(screen_order, function(s) results_nmf[[s]]$p))
+rownames(pval_mat_nmf) <- screen_order
+
+cat("\nNMF correlation matrix:\n")
+print(round(cor_mat_nmf, 4))
+cat("\nP-value matrix:\n")
+print(round(pval_mat_nmf, 4))
+#print(formatC(pval_mat_nmf, format = "e", digits = 2))
+@
+
+NMF correlation matrix:
+                    M1      M2      M3      M4      M5
+Belk_exhaust    0.0705 -0.1064 -0.1996  0.0041  0.2021
+Shifrut_prolif  0.1816  0.1703 -0.4267  0.3608  0.0795
+Schmidt_IL2     0.0447  0.0852 -0.0891  0.0055  0.1516
+Arce_IL2RA     -0.0633  0.0234  0.0168 -0.0107 -0.0919
+
+P-value matrix:
+                   M1     M2     M3     M4     M5
+Belk_exhaust   0.6266 0.4621 0.1646 0.9775 0.1592
+Shifrut_prolif 0.2069 0.2370 0.0020 0.0101 0.5832
+Schmidt_IL2    0.7579 0.5563 0.5384 0.9700 0.2932
+Arce_IL2RA     0.6625 0.8720 0.9079 0.9411 0.5254
+
+<<>>=
+## --- Build linked protein matrix ---
+linked_mat <- matrix(NA_real_, nrow = length(screen_order), ncol = 1,
+                     dimnames = list(screen_order, "Linked\nprotein"))
+linked_labels <- character(length(screen_order))
+for (i in seq_along(screen_order)) {
+  s <- screen_order[i]
+  linked_mat[i, 1] <- results_linked[[s]]
+  linked_labels[i] <- linked_proteins[s]
+}
+
+## --- Shared color scale ---
+lim <- 0.45
+col_fun <- colorRamp2(c(-lim, 0, lim), c("#2166AC", "#F7F7F7", "#B2182B"))
+
+## --- Row labels (screen name + n) ---
+row_labels_fmt <- sapply(screen_order, function(s) {
+  sprintf("%s\n(n = %d)", screen_labels[s], overlap_info[[s]]$n_used)
+})
+
+## --- Row annotation: readout type (left side, matching doc 1 style) ---
+readout_types <- screen_readout[screen_order]
+row_ha <- rowAnnotation(
+  Readout = readout_types,
+  col = list(Readout = readout_type_colors),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    title = "Readout type",
+    title_gp = gpar(fontsize = 9, fontface = "bold"),
+    labels_gp = gpar(fontsize = 8),
+    direction = "horizontal",
+    nrow = 1
+  ),
+  width = unit(4, "mm")
+)
+
+## --- Column (bottom) annotation for NMF heatmap ---
+## Matches doc 1: Module color bar + spacer + label text + title placeholder
+mod_order <- colnames(cor_mat_nmf)
+col_labels_fmt <- sprintf("%s\n%s", mod_order, module_names[mod_order])
+
+col_ha_nmf <- HeatmapAnnotation(
+  Module = mod_order,
+  spacer = anno_empty(height = unit(4, "mm"), border = FALSE),
+  Labels = anno_text(
+    col_labels_fmt,
+    gp = gpar(fontsize = 9),
+    rot = 0,
+    just = "center",
+    location = unit(0.5, "npc")
+  ),
+  Title = anno_empty(height = unit(6, "mm"), border = FALSE),
+  spacer2 = anno_empty(height = unit(8, "mm"), border = FALSE),
+  col = list(Module = module_colors),
+  show_legend = FALSE,
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(4, "mm"),
+  gap = unit(0, "mm")
+)
+
+## --- Cell function for NMF heatmap: bold highlight pairs, small grey otherwise ---
+cell_fun_nmf <- function(j, i, x, y, w, h, fill) {
+  val <- cor_mat_nmf[i, j]
+  if (is.na(val)) return()
+  rn <- rownames(cor_mat_nmf)[i]
+  cn <- colnames(cor_mat_nmf)[j]
+  is_key <- any(sapply(highlight_pairs, function(hp) hp[1] == rn && hp[2] == cn))
+
+  if (is_key) {
+    grid.text(sprintf("%.2f", val), x, y,
+              gp = gpar(fontsize = 14, fontface = "bold",
+                        col = ifelse(abs(val) > lim * 0.4, "white", "black")))
+  } else {
+    grid.text(sprintf("%.2f", val), x, y,
+              gp = gpar(fontsize = 10, col = "grey55"))
+  }
+}
+
+## --- Cell function for linked protein heatmap ---
+cell_fun_linked <- function(j, i, x, y, w, h, fill) {
+  val <- linked_mat[i, j]
+  if (is.na(val)) return()
+  grid.text(sprintf("%.2f", val), x, y - unit(1, "mm"),
+            gp = gpar(fontsize = 14, fontface = "bold",
+                      col = ifelse(abs(val) > lim * 0.4, "white", "black")))
+  grid.text(linked_labels[i], x, y + unit(3, "mm"),
+            gp = gpar(fontsize = 7,
+                      col = ifelse(abs(val) > lim * 0.4, "white", "grey30"),
+                      fontface = "italic"))
+}
+
+## --- Heatmap A: NMF modules ---
+ht_nmf <- Heatmap(
+  cor_mat_nmf,
+  name = "Pearson r",
+  col = col_fun,
+  na_col = "grey90",
+  cluster_rows    = FALSE,
+  cluster_columns = FALSE,
+
+  ## Rows
+  row_labels = row_labels_fmt,
+  row_names_gp = gpar(fontsize = 9, lineheight = 0.85),
+  row_names_side = "left",
+  left_annotation = row_ha,
+  row_title = "External CRISPR screens",
+  row_title_gp = gpar(fontsize = 11, fontface = "bold"),
+
+  ## Columns: labels via bottom annotation, not column_names
+  show_column_names = FALSE,
+  bottom_annotation = col_ha_nmf,
+
+  ## Cells
+  cell_fun = cell_fun_nmf,
+  border = TRUE,
+  rect_gp = gpar(col = "white", lwd = 1.5),
+
+  ## Legend
+  heatmap_legend_param = list(
+    title = "Pearson r",
+    title_gp = gpar(fontsize = 9, fontface = "bold"),
+    labels_gp = gpar(fontsize = 8),
+    at = round(seq(-lim, lim, length.out = 5), 2),
+    legend_width = unit(3, "cm"),
+    direction = "horizontal"
+  ),
+
+  ## Size: 5 columns x 4 rows
+  width  = unit(5 * 1.65, "cm"),
+  height = unit(4 * 1.8, "cm")
+)
+
+## --- Heatmap B: A priori linked protein ---
+ht_linked <- Heatmap(
+  linked_mat,
+  name = "Pearson r (linked)",
+  col = col_fun,
+  na_col = "grey90",
+  cluster_rows    = FALSE,
+  cluster_columns = FALSE,
+
+  show_row_names = FALSE,
+  column_labels = "A priori\nlinked protein",
+  column_names_gp = gpar(fontsize = 9, fontface = "bold", lineheight = 0.85),
+  column_names_rot = 0,
+  column_names_centered = TRUE,
+  column_names_side = "bottom",
+
+  cell_fun = cell_fun_linked,
+  border = TRUE,
+  rect_gp = gpar(col = "white", lwd = 1.5),
+
+  show_heatmap_legend = FALSE,
+
+  width  = unit(2.5, "cm"),
+  height = unit(4 * 1.8, "cm")
+)
+
+## --- Draw combined ---
+draw(ht_nmf + ht_linked,
+     merge_legend = TRUE,
+     heatmap_legend_side = "bottom",
+     annotation_legend_side = "bottom",
+     padding = unit(c(2, 2, 2, 20), "mm"))
+decorate_annotation("Title", {
+  grid.text("Semi-NMF modules",
+            x = unit(0.5, "npc"), y = unit(-0.3, "npc"),
+            gp = gpar(fontsize = 11, fontface = "bold"))
+})
+
+## Save
+pdf(file.path(OUTPUT_DIR, "parallel_correlation_comparison_v3.pdf"),
+    width = 9, height = 6.5)
+draw(ht_nmf + ht_linked,
+     merge_legend = TRUE,
+     heatmap_legend_side = "bottom",
+     annotation_legend_side = "bottom",
+     padding = unit(c(2, 2, 2, 2), "mm"))
+decorate_annotation("Title", {
+  grid.text("Semi-NMF modules",
+            x = unit(0.5, "npc"), y = unit(-0.3, "npc"),
+            gp = gpar(fontsize = 11, fontface = "bold"))
+})
+dev.off()
+@
+
+<<>>=
+## SECTION 10: Violin plot (all 201 proteins, NMF + linked overlaid)
+indiv_long <- lapply(screen_order, function(s) {
+  rv <- results_all_prot[[s]]
+  rv <- rv[is.finite(rv)]
+  tibble(screen = s, protein = names(rv), r = rv)
+}) %>% bind_rows() %>% mutate(
+    screen_label = recode(
+      screen,
+      Belk_exhaust   = "Belk exhaustion",
+      Shifrut_prolif = "Shifrut proliferation",
+      Schmidt_IL2    = "Schmidt IL-2",
+      Arce_IL2RA     = "Arce IL2RA"),
+    screen_label = factor(screen_label, levels = c(
+      "Belk exhaustion", "Shifrut proliferation",
+      "Schmidt IL-2", "Arce IL2RA")))
+
+## Reference points: NMF best module + linked protein
+ref_points <- bind_rows(
+  lapply(screen_order, function(s) {
+    r_vec <- results_nmf[[s]]$r
+    best <- which.max(abs(r_vec))
+    tibble(screen = s, method = "Semi-NMF (best module)",
+           r = r_vec[best], label = names(r_vec)[best])}),
+  lapply(screen_order, function(s) {
+    tibble(screen = s, method = "Linked protein (a priori)",
+           r = results_linked[[s]], label = linked_proteins[s])
+  })) %>% mutate(
+    screen_label = recode(
+      screen,
+      Belk_exhaust   = "Belk exhaustion",
+      Shifrut_prolif = "Shifrut proliferation",
+      Schmidt_IL2    = "Schmidt IL-2",
+      Arce_IL2RA     = "Arce IL2RA"),
+    screen_label = factor(screen_label, levels = c(
+      "Belk exhaustion", "Shifrut proliferation",
+      "Schmidt IL-2", "Arce IL2RA")),
+    method = factor(method, levels = c(
+      "Semi-NMF (best module)",
+      "Linked protein (a priori)"))
+  )
+
+p_dist <- ggplot(indiv_long, aes(x = screen_label, y = r)) +
+  geom_hline(yintercept = 0, linewidth = 0.3, color = "grey60") +
+  geom_violin(fill = "grey90", color = "grey50", alpha = 0.6, width = 0.7) +
+  geom_jitter(width = 0.15, size = 0.4, alpha = 0.3, color = "grey40") +
+  geom_point(data = ref_points,
+             aes(color = method, shape = method),
+             size = 3.5, stroke = 1.2,
+             position = position_dodge(width = 0.3)) +
+  scale_color_manual(values = c(
+    "Semi-NMF (best module)"    = "#B2182B",
+    "Linked protein (a priori)" = "#1B7837")) +
+  scale_shape_manual(values = c(
+    "Semi-NMF (best module)"    = 18,
+    "Linked protein (a priori)" = 16)) +
+  labs(x = NULL, y = "Pearson r with external screen",
+       color = NULL, shape = NULL) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position    = "top",
+    legend.text        = element_text(size = 10),
+    axis.text          = element_text(color = "black"),
+    axis.title.y       = element_text(face = "bold")
+  )
+
+ggsave(file.path(OUTPUT_DIR, "protein_correlation_distributions_v3.pdf"),
+       p_dist, width = 8, height = 5.5)
+@
+
+
+\end{document}

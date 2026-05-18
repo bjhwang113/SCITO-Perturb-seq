@@ -1,0 +1,507 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+SPLIT-HALF RELIABILITY ANALYSIS
+
+Purpose: Measure how well LFC estimates generalize to independent held-out data
+Split into A/B → Downsample A → Compare to B (true generalization)
+
+Design:
+  1. For each gene, randomly split cells into A (50\%) and B (50\%)
+  2. B is "held-out validation" — always use 100\% of B cells
+  3. A is "training" — downsample at various fractions
+  4. Correlation between A's LFC and B's LFC measures generalization
+  5. At 100\% of A, we get the "correlation ceiling" (reliability)
+
+Replication Strategy:
+  - Each replicate = new random split + new random downsampling
+  - This captures total uncertainty from both sources
+  - Report mean ± SD across replicates
+  
+<<>>=
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(stringr)
+})
+
+set.seed(42)
+
+theme_pub <- function(base_size = 15) {
+  theme_bw(base_size = base_size) + theme(
+      plot.title = element_text(face = "bold", size = rel(1.2)),
+      plot.subtitle = element_text(size = rel(0.9), color = "gray30"),
+      #axis.title = element_text(face = "bold"),
+      axis.text = element_text(color = "black"),
+      panel.grid.minor = element_blank(),
+      legend.background = element_rect(fill = "white", color = NA))
+}
+
+# PARAMETERS
+# Downsampling fractions (of the A half, so 100% = 50% of total cells)
+FRACTIONS <- c(0.10, 0.25, 0.50, 0.75, 1.00)
+
+# Number of replicates (each = new split + new downsampling)
+N_REPLICATES <- 10
+
+# Minimum cells per gene in EACH half (genes below this after split are excluded)
+MIN_CELLS_PER_HALF <- 10
+
+# Output directory
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/results/results_validation"
+#dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+cat("Parameters:\n")
+cat(sprintf("  Fractions of A: %s\n", paste(FRACTIONS * 100, collapse = "%, ") %>% paste0("%")))
+cat(sprintf("  Replicates: %d\n", N_REPLICATES))
+cat(sprintf("  Min cells per half: %d\n", MIN_CELLS_PER_HALF))
+cat(sprintf("  Output: %s\n\n", OUTPUT_DIR))
+
+# SECTION 1: LOAD DATA
+RAW_RDS <- "/home/ec2-user/scitoseq/data/deviance_norm.rds"
+cat(sprintf("Loading: %s\n", RAW_RDS))
+raw_data <- readRDS(RAW_RDS)
+
+# Clean protein names
+old_names <- rownames(raw_data)
+prefix_pat <- "^(anti-human-mouse-rat-|anti-mouse-human-|anti-human-mouse-|anti-human-|anti-mouse-|Mouse-|Rat-|ArmenianHamsterIgG-)"
+clean_names <- gsub(prefix_pat, "", old_names)
+clean_names <- gsub("-barcode\\d+$", "", clean_names)
+
+counts <- raw_data@assays$RNA@counts
+rownames(counts) <- clean_names
+meta <- raw_data@meta.data
+
+rm(raw_data); gc()
+
+# Remove problematic features
+drop_feats <- c("IgE", "IgLightChainL")
+counts <- counts[!(rownames(counts) %in% drop_feats), , drop = FALSE]
+
+all_proteins <- rownames(counts)
+n_proteins <- length(all_proteins)
+
+# Create clean guide columns
+meta$guide_target_clean <- ifelse(
+  grepl("NO-TARGET", meta$guide_target, ignore.case = TRUE),
+  "NTC", as.character(meta$guide_target))
+
+cat(sprintf("Data: %d proteins × %d cells\n", n_proteins, ncol(counts)))
+# Data: 201 proteins × 3134864 cells
+@
+
+<<>>=
+# SECTION 2: PREPARE NTC BASELINE (shared across all analyses)
+ntc_idx <- which(meta$guide_target_clean == "NTC")
+n_ntc <- length(ntc_idx)
+cat(sprintf("NTC cells: %d (used as shared reference)\n", n_ntc))
+
+counts_ntc <- counts[, ntc_idx, drop = FALSE]
+ntc_means <- Matrix::rowMeans(counts_ntc)
+ntc_sq_means <- Matrix::rowMeans(counts_ntc^2)
+ntc_vars <- (ntc_sq_means - ntc_means^2) * n_ntc / (n_ntc - 1)
+
+rm(counts_ntc); gc()
+
+# SECTION 3: BUILD GENE-CELL INDEX MAPPING
+non_ntc_idx <- which(meta$guide_target_clean != "NTC")
+gene_assignments <- meta$guide_target_clean[non_ntc_idx]
+
+unique_genes <- sort(unique(gene_assignments))
+n_genes <- length(unique_genes)
+
+cat(sprintf("Total genes: %d\n", n_genes))
+cat(sprintf("Total perturbation cells: %d\n", length(non_ntc_idx)))
+
+# Build list of cell indices per gene
+gene_to_cells <- split(non_ntc_idx, gene_assignments)
+gene_to_cells <- gene_to_cells[unique_genes]
+
+ncells_per_gene <- sapply(gene_to_cells, length)
+names(ncells_per_gene) <- unique_genes
+
+cat(sprintf("Cells per gene: min=%d, median=%.0f, max=%d\n",
+            min(ncells_per_gene), median(ncells_per_gene), max(ncells_per_gene)))
+# Cells per gene: min=1, median=147, max=1266
+@
+
+<<>>=
+# SECTION 4: LOAD FULL-DATA RESULTS FOR IDENTIFYING SIGNIFICANT PAIRS
+#gene_qval_full <- readRDS("/home/ec2-user/scitoseq/results/results_gene_level/gene_qval_mat.rds")
+
+results_dir <- "/home/ec2-user/scitoseq/results/results_gene_level"
+FDR_VERSION <- "per_protein"
+if (FDR_VERSION == "global") {
+  gene_qval_full <- readRDS(file.path(results_dir, "gene_qval_mat.rds"))
+  cat("Using GLOBAL FDR (BH across 3.5M tests) - most conservative\n")
+} else if (FDR_VERSION == "per_protein") {
+  # FIXED: per-protein FDR is in CORR_DIR
+  gene_qval_full <- readRDS(file.path(results_dir, "gene_qval_per_protein.rds"))
+  cat("Using PER-PROTEIN FDR (BH across 17K genes per protein)\n")
+} else if (FDR_VERSION == "per_gene") {
+  # FIXED: per-gene FDR is in CORR_DIR
+  gene_qval_full <- readRDS(file.path(results_dir, "gene_qval_per_gene.rds"))
+  cat("WARNING: Using PER-GENE FDR (only 201 tests per gene) - may inflate false positives!\n")
+}
+
+# Identify significant pairs (FDR < 0.10)
+sig_pairs <- which(gene_qval_full < 0.10, arr.ind = TRUE)
+sig_pairs_df <- data.frame(
+  gene = rownames(gene_qval_full)[sig_pairs[, 1]],
+  protein = colnames(gene_qval_full)[sig_pairs[, 2]],
+  stringsAsFactors = FALSE
+)
+sig_pairs_df$key <- paste(sig_pairs_df$gene, sig_pairs_df$protein, sep = "_")
+
+n_sig_pairs <- nrow(sig_pairs_df)
+cat(sprintf("Significant pairs (FDR < 0.10): %d\n", n_sig_pairs))
+@
+
+<<>>=
+# SECTION 5: LOAD SELF-TARGETED MAPPING
+marker_gene_df <- readRDS("/home/ec2-user/scitoseq/data/marker_gene_df.rds")
+
+gene_to_marker_map <- marker_gene_df %>%
+  mutate(gene_list = str_split(gene, pattern = ";")) %>%
+  unnest_longer(gene_list, values_to = "gene_single") %>%
+  filter(!is.na(gene_single), nzchar(trimws(gene_single))) %>%
+  mutate(gene_single = trimws(gene_single)) %>%
+  distinct(gene_single, marker) %>%
+  rename(gene = gene_single, protein = marker)
+
+gene_to_marker_map$key <- paste(gene_to_marker_map$gene, gene_to_marker_map$protein, sep = "_")
+n_self_targeted <- nrow(gene_to_marker_map)
+
+cat(sprintf("Self-targeted gene-protein mappings: %d\n", n_self_targeted))
+
+# ==============================================================================
+# SECTION 6: HELPER FUNCTION TO COMPUTE LFC FROM CELL INDICES
+# ==============================================================================
+compute_lfc_from_cells <- function(cell_list, genes_to_use) {
+  #' Compute gene-level LFC given a list of cell indices per gene
+  #'
+  #' @param cell_list Named list: gene -> vector of cell indices
+  #' @param genes_to_use Character vector of genes to include
+  #' @return Matrix of LFC (genes × proteins)
+  
+  # Filter to genes we want
+  cell_list <- cell_list[genes_to_use]
+  n_genes_use <- length(genes_to_use)
+  
+  # Flatten cells and create gene mapping
+  all_cells <- unlist(cell_list, use.names = FALSE)
+  cell_genes <- rep(genes_to_use, sapply(cell_list, length))
+  
+  # Get counts for these cells
+  counts_subset <- counts[, all_cells, drop = FALSE]
+  
+  # Build sparse indicator matrix
+  gene_factor <- factor(cell_genes, levels = genes_to_use)
+  indicator <- Matrix::sparseMatrix(
+    i = seq_along(cell_genes),
+    j = as.integer(gene_factor),
+    x = 1,
+    dims = c(length(cell_genes), n_genes_use)
+  )
+  
+  # Cell counts per gene
+  ncells <- Matrix::colSums(indicator)
+  names(ncells) <- genes_to_use
+  
+  # Compute sums → means
+  gene_sums <- counts_subset %*% indicator  # proteins × genes
+  gene_means <- sweep(as.matrix(gene_sums), 2, ncells, "/")
+  
+  # LFC = gene mean - NTC mean
+  lfc_mat <- t(gene_means) - matrix(ntc_means, nrow = n_genes_use, ncol = n_proteins, byrow = TRUE)
+  rownames(lfc_mat) <- genes_to_use
+  colnames(lfc_mat) <- all_proteins
+  
+  return(lfc_mat)
+}
+@
+
+<<>>=
+results_df <- readRDS(file.path(OUTPUT_DIR, "split_half_all_results.rds"))
+summary_df <- readRDS(file.path(OUTPUT_DIR, "split_half_summary.rds"))
+# the two data frames are from the code below
+
+# SECTION 7: SPLIT-HALF RELIABILITY ANALYSIS
+
+all_results <- list()
+result_idx <- 1
+
+t_start <- Sys.time()
+
+for (rep in 1:N_REPLICATES) {
+  cat(sprintf("Replicate %d/%d:\n", rep, N_REPLICATES))
+  
+  set.seed(42 + rep * 1000)
+  
+  # ----- Step 1: Split cells into A and B for each gene -----
+  cells_A <- list()
+  cells_B <- list()
+  genes_valid <- c()
+  
+  for (gene in unique_genes) {
+    gene_cells <- gene_to_cells[[gene]]
+    n_cells <- length(gene_cells)
+    
+    # Shuffle and split 50/50
+    shuffled <- sample(gene_cells)
+    n_A <- floor(n_cells / 2)
+    n_B <- n_cells - n_A
+    
+    # Skip if either half has too few cells
+    if (n_A < MIN_CELLS_PER_HALF || n_B < MIN_CELLS_PER_HALF) next
+    
+    cells_A[[gene]] <- shuffled[1:n_A]
+    cells_B[[gene]] <- shuffled[(n_A + 1):n_cells]
+    genes_valid <- c(genes_valid, gene)
+  }
+  
+  n_genes_valid <- length(genes_valid)
+  cat(sprintf("  Genes with sufficient cells in both halves: %d\n", n_genes_valid))
+  
+  # ----- Step 2: Compute validation LFC (100% of B) -----
+  lfc_B <- compute_lfc_from_cells(cells_B, genes_valid)
+  
+  # ----- Step 3: For each fraction, downsample A and compute correlation -----
+  for (frac in FRACTIONS) {
+    
+    # Downsample from A
+    cells_A_down <- list()
+    for (gene in genes_valid) {
+      n_A <- length(cells_A[[gene]])
+      n_keep <- max(MIN_CELLS_PER_HALF, round(n_A * frac))
+      n_keep <- min(n_keep, n_A)  # Can't keep more than available
+      cells_A_down[[gene]] <- sample(cells_A[[gene]], n_keep)
+    }
+    
+    # Compute training LFC
+    lfc_A <- compute_lfc_from_cells(cells_A_down, genes_valid)
+    
+    # ----- Step 4: Compute correlations -----
+    
+    # Create vectors for correlation
+    lfc_A_vec <- as.vector(lfc_A)
+    lfc_B_vec <- as.vector(lfc_B)
+    
+    valid_idx <- !is.na(lfc_A_vec) & !is.na(lfc_B_vec) & 
+                 is.finite(lfc_A_vec) & is.finite(lfc_B_vec)
+    
+    # All pairs
+    cor_all_pearson <- cor(lfc_A_vec[valid_idx], lfc_B_vec[valid_idx], method = "pearson")
+    cor_all_spearman <- cor(lfc_A_vec[valid_idx], lfc_B_vec[valid_idx], method = "spearman")
+    
+    # Significant pairs only (FDR < 0.10 in full data)
+    # Create keys for this subset
+    gene_protein_grid <- expand.grid(gene = genes_valid, protein = all_proteins, 
+                                      stringsAsFactors = FALSE)
+    gene_protein_grid$key <- paste(gene_protein_grid$gene, gene_protein_grid$protein, sep = "_")
+    gene_protein_grid$idx <- 1:nrow(gene_protein_grid)
+    
+    sig_idx <- which(gene_protein_grid$key %in% sig_pairs_df$key)
+    
+    if (length(sig_idx) > 10) {
+      sig_valid <- sig_idx[valid_idx[sig_idx]]
+      cor_sig_pearson <- cor(lfc_A_vec[sig_valid], lfc_B_vec[sig_valid], method = "pearson")
+      cor_sig_spearman <- cor(lfc_A_vec[sig_valid], lfc_B_vec[sig_valid], method = "spearman")
+      n_sig_used <- length(sig_valid)
+    } else {
+      cor_sig_pearson <- NA
+      cor_sig_spearman <- NA
+      n_sig_used <- 0
+    }
+    
+    # Self-targeted pairs
+    self_idx <- which(gene_protein_grid$key %in% gene_to_marker_map$key)
+    
+    if (length(self_idx) > 5) {
+      self_valid <- self_idx[valid_idx[self_idx]]
+      cor_self_pearson <- cor(lfc_A_vec[self_valid], lfc_B_vec[self_valid], method = "pearson")
+      
+      # Sign agreement for self-targeted
+      sign_agree <- mean(sign(lfc_A_vec[self_valid]) == sign(lfc_B_vec[self_valid]))
+      # Both positive (expected for CRISPRa)
+      both_pos <- mean(lfc_A_vec[self_valid] > 0 & lfc_B_vec[self_valid] > 0)
+      n_self_used <- length(self_valid)
+    } else {
+      cor_self_pearson <- NA
+      sign_agree <- NA
+      both_pos <- NA
+      n_self_used <- 0
+    }
+    
+    # Mean cells per gene in downsampled A
+    mean_cells_A <- mean(sapply(cells_A_down, length))
+    
+    # Store results
+    all_results[[result_idx]] <- data.frame(
+      replicate = rep,
+      fraction = frac,
+      n_genes = n_genes_valid,
+      mean_cells_A = mean_cells_A,
+      cor_all_pearson = cor_all_pearson,
+      cor_all_spearman = cor_all_spearman,
+      cor_sig_pearson = cor_sig_pearson,
+      cor_sig_spearman = cor_sig_spearman,
+      n_sig_pairs = n_sig_used,
+      cor_self_pearson = cor_self_pearson,
+      self_sign_agree = sign_agree,
+      self_both_pos = both_pos,
+      n_self_pairs = n_self_used,
+      stringsAsFactors = FALSE
+    )
+    result_idx <- result_idx + 1
+    
+    cat(sprintf("    Frac %.0f%%: cor_all=%.3f, cor_sig=%.3f, cor_self=%.3f, mean_cells=%.0f\n",
+                frac * 100, cor_all_pearson, 
+                ifelse(is.na(cor_sig_pearson), NA, cor_sig_pearson),
+                ifelse(is.na(cor_self_pearson), NA, cor_self_pearson),
+                mean_cells_A))
+  }
+}
+
+results_df <- bind_rows(all_results)
+
+elapsed <- difftime(Sys.time(), t_start, units = "mins")
+cat(sprintf("\nCompleted in %.1f minutes\n", elapsed))
+# 10.4min
+
+summary_df <- results_df %>% group_by(fraction) %>% summarise(
+    n_genes_mean = mean(n_genes),
+    mean_cells_A = mean(mean_cells_A),
+    
+    cor_all_mean = mean(cor_all_pearson),
+    cor_all_sd = sd(cor_all_pearson),
+    cor_all_min = min(cor_all_pearson),
+    cor_all_max = max(cor_all_pearson),
+    
+    cor_sig_mean = mean(cor_sig_pearson, na.rm = TRUE),
+    cor_sig_sd = sd(cor_sig_pearson, na.rm = TRUE),
+    
+    cor_self_mean = mean(cor_self_pearson, na.rm = TRUE),
+    cor_self_sd = sd(cor_self_pearson, na.rm = TRUE),
+    
+    self_sign_agree_mean = mean(self_sign_agree, na.rm = TRUE),
+    self_both_pos_mean = mean(self_both_pos, na.rm = TRUE),
+    
+    n_sig_pairs_mean = mean(n_sig_pairs),
+    n_self_pairs_mean = mean(n_self_pairs),
+    
+    .groups = "drop"
+  )
+
+# Add percentage labels
+summary_df$fraction_pct <- paste0(summary_df$fraction * 100, "%")
+@
+
+<<>>=
+# The correlation ceiling is at 100% of A (which is 50% of total cells)
+cor_ceiling_all <- summary_df$cor_all_mean[summary_df$fraction == 1.0]
+cor_ceiling_sig <- summary_df$cor_sig_mean[summary_df$fraction == 1.0]
+cor_ceiling_self <- summary_df$cor_self_mean[summary_df$fraction == 1.0]
+
+cat("Summary by downsampling fraction:\n\n")
+
+display_df <- summary_df %>%
+  select(fraction_pct, n_genes_mean, mean_cells_A, 
+         cor_all_mean, cor_sig_mean, cor_self_mean, self_both_pos_mean) %>%
+  mutate(
+    n_genes_mean = round(n_genes_mean),
+    mean_cells_A = round(mean_cells_A),
+    cor_all_mean = round(cor_all_mean, 3),
+    cor_sig_mean = round(cor_sig_mean, 3),
+    cor_self_mean = round(cor_self_mean, 3),
+    self_both_pos_mean = round(self_both_pos_mean * 100, 1)
+  )
+
+names(display_df) <- c("Fraction", "Genes", "MeanCells", "Cor(All)", 
+                       "Cor(Sig)", "Cor(Self)", "Self%BothPos")
+print(display_df)
+
+cat(sprintf("\n--- Correlation Ceilings (at 100%% of A = 50%% total cells) ---\n"))
+cat(sprintf("All pairs: r = %.3f\n", cor_ceiling_all))
+cat(sprintf("Significant pairs (FDR<0.10): r = %.3f\n", cor_ceiling_sig))
+cat(sprintf("Self-targeted pairs: r = %.3f\n", cor_ceiling_self))
+@
+
+# A tibble: 5 × 7
+  Fraction Genes MeanCells `Cor(All)` `Cor(Sig)` `Cor(Self)` `Self%BothPos`
+  <chr>    <dbl>     <dbl>      <dbl>      <dbl>       <dbl>          <dbl>
+1 10%      17336        12      0.036      0.725       0.668           60  
+2 25%      17336        23      0.045      0.808       0.709           62.4
+3 50%      17336        45      0.058      0.866       0.761           66.4
+4 75%      17336        67      0.07       0.892       0.811           68.5
+5 100%     17336        89      0.079      0.905       0.828           69.5
+
+--- Correlation Ceilings (at 100% of A = 50% total cells) ---
+All pairs: r = 0.079
+Significant pairs (FDR<0.10): r = 0.905
+Self-targeted pairs: r = 0.828
+
+<<>>=
+# Color palette
+color_all <- "#0086a8"
+color_sig <- "#a00e00"
+color_self <- "#d04e00"
+
+plot_data <- summary_df %>% select(
+  fraction, mean_cells_A, cor_all_mean, cor_all_sd,
+  cor_sig_mean, cor_sig_sd, cor_self_mean, cor_self_sd) %>% pivot_longer(
+    cols = c(cor_all_mean, cor_sig_mean, cor_self_mean),
+    names_to = "subset", values_to = "correlation") %>% mutate(
+    sd = case_when(
+      subset == "cor_all_mean" ~ cor_all_sd,
+      subset == "cor_sig_mean" ~ cor_sig_sd,
+      subset == "cor_self_mean" ~ cor_self_sd),
+    subset = case_when(
+      subset == "cor_all_mean" ~ "All pairs",
+      subset == "cor_sig_mean" ~ "Significant (FDR<0.10)",
+      subset == "cor_self_mean" ~ "Self-targeted")) %>%
+  select(fraction, mean_cells_A, subset, correlation, sd)
+
+plot_data$subset <- factor(plot_data$subset, 
+  levels = c("All pairs", "Significant (FDR<0.10)", "Self-targeted"))
+
+# Ceiling lines
+ceiling_df <- data.frame(subset = factor(
+  c("All pairs", "Significant (FDR<0.10)", "Self-targeted"),
+  levels = c("All pairs", "Significant (FDR<0.10)", "Self-targeted")),
+  ceiling = c(cor_ceiling_all, cor_ceiling_sig, cor_ceiling_self))
+@
+
+<<>>=
+p_cells <- plot_data %>% filter(subset != "All pairs") %>%
+  ggplot(aes(x = mean_cells_A, y = correlation, color = subset)) +
+  geom_hline(data = ceiling_df[ceiling_df$subset != "All pairs", ], aes(yintercept = ceiling, color = subset),
+             linetype = "dotted", linewidth = 0.8, alpha = 0.7) +
+  geom_ribbon(aes(ymin = correlation - sd, ymax = correlation + sd, fill = subset),
+              alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1.2) + geom_point(size = 3) +
+  scale_color_manual(values = c(#"All pairs" = color_all, 
+                                "Significant (FDR<0.10)" = color_sig,
+                                "Self-targeted" = color_self)) +
+  scale_fill_manual(values = c(#"All pairs" = color_all, 
+                               "Significant (FDR<0.10)" = color_sig,
+                               "Self-targeted" = color_self)) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + labs(
+    #title = "Split-Half Reliability vs Cell Count",
+    #subtitle = "Like Zhu et al. Fig 1h: correlation plateaus as cells increase",
+    x = "Mean cells per gene (training half)",
+    y = "Correlation with held-out half (r)",
+    color = NULL, fill = NULL) +
+  theme_pub() + theme(legend.position = c(0.75, 0.15))
+p_cells
+#  "/home/ec2-user/scitoseq/results/results_validation/fig_split_half_by_cells.pdf"
+ggsave("/home/ec2-user/scitoseq/fig/fig1/fig_split_half_by_cells.pdf",
+       p_cells, width = 7, height = 4.5, dpi = 300)
+@
+
+\end{document}

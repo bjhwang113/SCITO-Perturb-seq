@@ -1,0 +1,273 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+Module–Module Correlation Heatmaps (k=5 Semi-NMF, L2-Normalized)
+
+Two complementary views of module relationships:
+
+1. Plot 1 — cor(W):  Perturbation effect structure
+  "Across 2,848 gene perturbations, do modules get co-activated or opposed?"
+  Signed W allows strong negative correlations → reveals opposition axes.
+
+2. Plot 2 — cor(t(H)):  Protein signature overlap
+  "Across 201 surface proteins, do modules share similar loadings?"
+  H ≥ 0 in semi-NMF, so correlations skew positive → measures shared
+  vs. distinct protein signatures rather than opposition.
+
+Both use L2-normalized W and H (scale transferred from W into H).
+
+<<>>=
+suppressPackageStartupMessages({
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+
+INPUT_DIR  <- "/home/ec2-user/scitoseq/results/semiNMF_v1_analysis"
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/fig/fig3"
+#dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+modules <- paste0("M", 1:5)
+
+MODULE_NAMES <- c(
+  "M1" = "Adhesion &\nImmune Reg.",
+  "M2" = "Tissue /\nInnate-like",
+  "M3" = "Resting /\nNaive",
+  "M4" = "Activation /\nProlif.",
+  "M5" = "Effector /\nExhaustion"
+)
+
+MODULE_COLORS <- c(
+  "M1" = "#da7901",
+  "M2" = "#20235b",
+  "M3" = "#637b31",
+  "M4" = "#931e18",
+  "M5" = "#f0be3d"
+)
+
+# 1. LOAD AND L2-NORMALIZE
+cat("Loading k=5 semi-NMF model...\n")
+model_k5 <- readRDS(file.path(INPUT_DIR, "model_k5.rds"))
+W_raw <- model_k5$W
+H_raw <- model_k5$H
+
+colnames(W_raw) <- modules
+rownames(H_raw) <- modules
+
+d <- sqrt(colSums(W_raw^2))
+W <- sweep(W_raw, 2, d, "/")
+H <- diag(d) %*% H_raw
+rownames(H) <- modules
+colnames(H) <- colnames(H_raw)
+
+cat(sprintf("W: %d genes × %d modules (L2-normalized)\n", nrow(W), ncol(W)))
+cat(sprintf("H: %d modules × %d proteins\n", nrow(H), ncol(H)))
+
+# 2. COMPUTE CORRELATIONS
+cor_W <- cor(W, method = "pearson")
+cat("\nW-based module correlations (perturbation structure):\n")
+print(round(cor_W, 3))
+
+cor_H <- cor(t(H), method = "pearson")
+cat("\nH-based module correlations (protein signature overlap):\n")
+print(round(cor_H, 3))
+@
+
+W-based module correlations (perturbation structure):
+       M1     M2     M3     M4     M5
+M1  1.000 -0.108 -0.558 -0.091 -0.067
+M2 -0.108  1.000 -0.199  0.237 -0.410
+M3 -0.558 -0.199  1.000 -0.294  0.018
+M4 -0.091  0.237 -0.294  1.000 -0.280
+M5 -0.067 -0.410  0.018 -0.280  1.000
+
+H-based module correlations (protein signature overlap):
+       M1     M2     M3     M4     M5
+M1  1.000  0.274 -0.389  0.091 -0.058
+M2  0.274  1.000 -0.508  0.291  0.325
+M3 -0.389 -0.508  1.000 -0.541 -0.490
+M4  0.091  0.291 -0.541  1.000  0.145
+M5 -0.058  0.325 -0.490  0.145  1.000
+
+<<>>=
+# 3. CELL FUNCTION FACTORY
+make_cell_fun <- function(cor_mat) {
+  force(cor_mat)
+  function(j, i, x, y, width, height, fill) {
+    r <- cor_mat[i, j]
+    txt_col <- ifelse(abs(r) > 0.35, "white", "grey20")
+    if (i == j) {
+      grid.text("1", x, y,
+                gp = gpar(fontsize = 12, col = "grey50", fontface = "plain"))
+    } else {
+      grid.text(sprintf("%.2f", r), x, y,
+                gp = gpar(fontsize = 12, fontface = "bold", col = txt_col))
+    }
+  }
+}
+
+# 4. SHARED HEATMAP BUILDER
+build_cor_heatmap <- function(cor_mat, legend_title, cap) {
+
+  col_fun <- colorRamp2(
+    breaks = c(-cap, 0, cap),
+    colors = c("#2166AC", "#F7F7F7", "#B2182B")
+  )
+
+  # Row annotation: color sidebar WITH legend (will be drawn separately)
+  row_anno <- rowAnnotation(
+    Module = modules,
+    col = list(Module = MODULE_COLORS),
+    show_annotation_name = FALSE,
+    show_legend = TRUE,
+    simple_anno_size = unit(4, "mm"),
+    annotation_legend_param = list(
+      Module = list(
+        title         = "Module",
+        title_gp      = gpar(fontsize = 10, fontface = "bold"),
+        labels_gp     = gpar(fontsize = 9),
+        direction     = "horizontal",
+        nrow          = 1,
+        border        = "grey40",
+        grid_height   = unit(4, "mm"),
+        grid_width    = unit(6, "mm")
+      )
+    )
+  )
+
+  row_labels <- paste0(modules, "\n", MODULE_NAMES[modules])
+
+  Heatmap(
+    cor_mat,
+    name = legend_title,
+    col  = col_fun,
+
+    cluster_rows    = FALSE,
+    cluster_columns = FALSE,
+
+    left_annotation = row_anno,
+    row_labels      = row_labels,
+    row_names_gp    = gpar(fontsize = 9.5, lineheight = 0.82),
+    row_names_side  = "right",
+
+    column_labels         = modules,
+    column_names_gp       = gpar(fontsize = 11, fontface = "bold"),
+    column_names_rot      = 0,
+    column_names_centered = TRUE,
+    column_names_side     = "bottom",
+
+    cell_fun = make_cell_fun(cor_mat),
+
+    border    = TRUE,
+    border_gp = gpar(col = "grey30", lwd = 0.8),
+    rect_gp   = gpar(col = "white", lwd = 1.8),
+
+    width  = unit(7.5, "cm"),
+    height = unit(7.5, "cm"),
+
+    heatmap_legend_param = list(
+      title           = legend_title,
+      title_gp        = gpar(fontsize = 10, fontface = "bold"),
+      labels_gp       = gpar(fontsize = 9),
+      legend_width    = unit(5, "cm"),
+      border          = "grey40",
+      direction       = "horizontal",
+      title_position  = "lefttop",
+      at              = seq(-cap, cap, by = cap / 3),
+      labels          = sprintf("%.1f", seq(-cap, cap, by = cap / 3))
+    )
+  )
+}
+
+# 5. PLOT 1 — W CORRELATION
+cat("\n=== Plot 1: W-based correlation heatmap ===\n")
+
+cap_W <- ceiling(max(abs(cor_W[upper.tri(cor_W)])) * 10) / 10
+cat(sprintf("W cor cap: ±%.1f\n", cap_W))
+
+ht_W <- build_cor_heatmap(cor_W, "Pearson r\n(W: gene coef.)", cap_W)
+
+out_W_pdf <- file.path(OUTPUT_DIR, "module_cor_W_perturbation_structure_V1.pdf")
+pdf(out_W_pdf, width = 5.5, height = 5.5)
+draw(ht_W,
+     heatmap_legend_side    = "bottom",
+     annotation_legend_side = "bottom",
+     merge_legend           = TRUE,
+     padding = unit(c(4, 4, 8, 4), "mm"))
+dev.off()
+@
+
+
+<<>>=
+# 6. PLOT 2 — H CORRELATION
+cat("\n=== Plot 2: H-based correlation heatmap ===\n")
+
+cap_H <- ceiling(max(abs(cor_H[upper.tri(cor_H)])) * 10) / 10
+cap_H <- max(cap_H, 0.5)
+cat(sprintf("H cor cap: ±%.1f\n", cap_H))
+
+ht_H <- build_cor_heatmap(cor_H, "Pearson r\n(H: protein sig.)", cap_H)
+
+out_H_pdf <- file.path(OUTPUT_DIR, "module_cor_H_protein_overlap.pdf")
+pdf(out_H_pdf, width = 5.5, height = 4.5)
+draw(ht_H,
+     heatmap_legend_side = "bottom",
+     padding = unit(c(4, 4, 4, 4), "mm"))
+dev.off()
+
+# out_H_png <- file.path(OUTPUT_DIR, "module_cor_H_protein_overlap.png")
+# png(out_H_png, width = 5.5, height = 4.5, units = "in", res = 300)
+# draw(ht_H,
+#      heatmap_legend_side = "right",
+#      padding = unit(c(4, 4, 4, 4), "mm"))
+# dev.off()
+@
+
+<<>>=
+# COMPARISON: W vs H module correlations
+cat("Pair-wise comparison (upper triangle):\n")
+cat(sprintf("  %-8s  %8s  %8s  %s\n", "Pair", "cor(W)", "cor(H)", "Interpretation"))
+cat(paste(rep("-", 70), collapse = ""), "\n")
+
+pairs <- combn(modules, 2)
+for (k in 1:ncol(pairs)) {
+  mi <- pairs[1, k]
+  mj <- pairs[2, k]
+  rw <- cor_W[mi, mj]
+  rh <- cor_H[mi, mj]
+
+  interp <- ""
+  if (rw < -0.3 & rh < 0.3) {
+    interp <- "Opposing programs, distinct signatures"
+  } else if (rw < -0.3 & rh >= 0.3) {
+    interp <- "Opposing programs, shared proteins"
+  } else if (rw > 0.15 & rh > 0.3) {
+    interp <- "Co-activated, shared signatures"
+  } else if (rw > 0.15 & rh < 0.3) {
+    interp <- "Co-activated, distinct signatures"
+  } else if (abs(rw) <= 0.15) {
+    interp <- "Independent programs"
+  } else {
+    interp <- "Weak/mixed"
+  }
+
+  cat(sprintf("  %s–%s  %+8.3f  %+8.3f  %s\n", mi, mj, rw, rh, interp))
+}
+@
+
+  Pair        cor(W)    cor(H)  Interpretation
+  M1–M2    -0.108    +0.274  Independent programs
+  M1–M3    -0.558    -0.389  Opposing programs, distinct signatures
+  M1–M4    -0.091    +0.091  Independent programs
+  M1–M5    -0.067    -0.058  Independent programs
+  M2–M3    -0.199    -0.508  Weak/mixed
+  M2–M4    +0.237    +0.291  Co-activated, distinct signatures
+  M2–M5    -0.410    +0.325  Opposing programs, shared proteins
+  M3–M4    -0.294    -0.541  Weak/mixed
+  M3–M5    +0.018    -0.490  Independent programs
+  M4–M5    -0.280    +0.145  Weak/mixed
+  
+\end{document}

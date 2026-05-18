@@ -1,0 +1,536 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+Semi-NMF Comparison: Four Preprocessing Versions
+Versions:
+  1. Z-score, cis-masked
+  2. Z-score, cis-included
+  3. LFC, cis-masked
+  4. LFC, cis-included
+
+All versions use: Per-protein FDR < 0.1 gene filtering
+
+<<>>=
+library(NMF)
+library(hNMF)
+library(Matrix)
+
+# Paths
+GENE_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/results/semiNMF_comparison"
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Parameters
+FDR_THRESHOLD <- 0.1
+RANK_GRID <- 5:25
+NMF_NRUNS <- 10
+NMF_MAXITER <- 100  # for rank estimation; can increase for final run
+NMF_SEED <- 42
+
+cat(sprintf("FDR threshold: %g\n", FDR_THRESHOLD))
+cat(sprintf("Rank grid: %d to %d\n", min(RANK_GRID), max(RANK_GRID)))
+cat(sprintf("Runs per rank: %d\n", NMF_NRUNS))
+cat(sprintf("Output directory: %s\n", OUTPUT_DIR))
+
+# Load Data
+ene_zscore_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_zscore_mat.rds"))
+gene_lfc_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_lfc_mat.rds"))
+gene_qval_per_protein <- readRDS(file.path(GENE_RESULTS_DIR, "gene_qval_per_protein.rds"))
+self_targeted_gene <- readRDS(file.path(GENE_RESULTS_DIR, "self_targeted_gene.rds"))
+
+cat(sprintf("  Z-score matrix: %d genes × %d proteins\n", nrow(gene_zscore_mat), ncol(gene_zscore_mat)))# Z-score matrix: 17336 genes × 201 proteins
+cat(sprintf("  LFC matrix: %d genes × %d proteins\n", nrow(gene_lfc_mat), ncol(gene_lfc_mat)))
+# LFC matrix: 17336 genes × 201 proteins
+cat(sprintf("  Self-targeted pairs: %d\n", nrow(self_targeted_gene)))
+# Self-targeted pairs: 195
+
+# Gene Filtering: Per-protein FDR < 0.1
+# Gene passes if ANY protein has FDR < threshold
+gene_min_qval <- apply(gene_qval_per_protein, 1, min, na.rm = TRUE)
+genes_filtered <- names(gene_min_qval)[gene_min_qval < FDR_THRESHOLD]
+
+cat(sprintf("  Genes passing filter: %d / %d (%.1f%%)\n", 
+            length(genes_filtered), nrow(gene_zscore_mat),
+            100 * length(genes_filtered) / nrow(gene_zscore_mat)))
+# Genes passing filter: 2848 / 17336 (16.4%)
+
+# Sanity check: distribution of significant proteins per gene
+n_sig_per_gene <- rowSums(gene_qval_per_protein[genes_filtered, ] < FDR_THRESHOLD, na.rm = TRUE)
+cat(sprintf("  Median significant proteins per filtered gene: %d\n", median(n_sig_per_gene)))
+cat(sprintf("  Range: %d - %d\n", min(n_sig_per_gene), max(n_sig_per_gene)))
+# Median significant proteins per filtered gene: 1
+# Range: 1 - 25
+
+# Create Masking Function
+mask_cis_pairs <- function(mat, self_targeted_df) {
+  # Create a copy
+
+mat_masked <- mat
+n_masked <- 0
+  
+for (i in 1:nrow(self_targeted_df)) {
+    gene <- self_targeted_df$gene[i]
+    protein <- self_targeted_df$protein[i]
+    if (gene %in% rownames(mat_masked) && protein %in% colnames(mat_masked)) {
+      mat_masked[gene, protein] <- 0  # Set to 0 for semi-NMF (can't handle NA)
+      n_masked <- n_masked + 1
+    }
+  }
+  
+  cat(sprintf("  Masked %d cis-pairs (set to 0)\n", n_masked))
+  return(mat_masked)
+}
+
+# Prepare Four Input Matrices
+# Helper to clean matrix (handle NA/Inf)
+clean_matrix <- function(mat) {
+  mat[is.na(mat)] <- 0
+  mat[!is.finite(mat)] <- 0
+  return(mat)
+}
+
+# Version 1: Z-score, masked
+cat("\n[Version 1] Z-score, cis-masked:\n")
+mat_v1 <- gene_zscore_mat[genes_filtered, , drop = FALSE]
+mat_v1 <- mask_cis_pairs(mat_v1, self_targeted_gene)
+mat_v1 <- clean_matrix(mat_v1)
+cat(sprintf("  Final dimensions: %d × %d\n", nrow(mat_v1), ncol(mat_v1)))
+cat(sprintf("  Value range: [%.2f, %.2f]\n", min(mat_v1), max(mat_v1)))
+# Final dimensions: 2848 × 201
+# Value range: [-17.34, 9.82]
+
+# Version 2: Z-score, unmasked
+cat("\n[Version 2] Z-score, cis-included:\n")
+mat_v2 <- gene_zscore_mat[genes_filtered, , drop = FALSE]
+mat_v2 <- clean_matrix(mat_v2)
+cat(sprintf("  Final dimensions: %d × %d\n", nrow(mat_v2), ncol(mat_v2)))
+cat(sprintf("  Value range: [%.2f, %.2f]\n", min(mat_v2), max(mat_v2)))
+
+# Version 3: LFC, masked
+cat("\n[Version 3] LFC, cis-masked:\n")
+mat_v3 <- gene_lfc_mat[genes_filtered, , drop = FALSE]
+mat_v3 <- mask_cis_pairs(mat_v3, self_targeted_gene)
+mat_v3 <- clean_matrix(mat_v3)
+cat(sprintf("  Final dimensions: %d × %d\n", nrow(mat_v3), ncol(mat_v3)))
+cat(sprintf("  Value range: [%.2f, %.2f]\n", min(mat_v3), max(mat_v3)))
+
+# Version 4: LFC, unmasked
+cat("\n[Version 4] LFC, cis-included:\n")
+mat_v4 <- gene_lfc_mat[genes_filtered, , drop = FALSE]
+mat_v4 <- clean_matrix(mat_v4)
+cat(sprintf("  Final dimensions: %d × %d\n", nrow(mat_v4), ncol(mat_v4)))
+cat(sprintf("  Value range: [%.2f, %.2f]\n", min(mat_v4), max(mat_v4)))
+
+# Store in list for iteration
+version_list <- list(
+  "v1_zscore_masked" = mat_v1,
+  "v2_zscore_unmasked" = mat_v2,
+  "v3_lfc_masked" = mat_v3,
+  "v4_lfc_unmasked" = mat_v4
+)
+
+# Save the input matrices for reproducibility
+cat("\nSaving input matrices...\n")
+saveRDS(version_list, file.path(OUTPUT_DIR, "input_matrices.rds"))
+saveRDS(genes_filtered, file.path(OUTPUT_DIR, "genes_filtered.rds"))
+@
+
+<<>>=
+# Semi-NMF Wrapper Function
+semi_wrapper <- function(x, seed, maxiter = 800, ...) {
+  # x: data matrix
+  # seed: pre-initialized NMF object from the package
+  # maxiter and ...: additional parameters
+  
+  # Get the current rank from the seed object
+  current_rank <- nbasis(seed)
+  
+  # Initialize H with small positive values to avoid singularity
+  H_improved <- matrix(runif(current_rank * ncol(x), 0.01, 1), 
+                       nrow = current_rank, ncol = ncol(x))
+  W_improved <- matrix(rnorm(nrow(x) * current_rank), 
+                       nrow = nrow(x), ncol = current_rank)
+  
+  # Update the seed with better initialization
+  NMF::basis(seed) <- W_improved
+  NMF::coef(seed) <- H_improved
+  
+  # Test if H is invertible before proceeding
+  H_test <- try(MASS::ginv(NMF::coef(seed)), silent = TRUE)
+  
+  if (inherits(H_test, "try-error")) {
+    warning("H matrix may be problematic for semi-NMF, using original seed")
+  }
+  
+  # Run semi-NMF using the seed object
+  result <- hNMF::semiNMF(X = x, nmfMod = seed, 
+                          maxiter = maxiter, checkDivergence = FALSE)
+  return(result)
+}
+
+# Run Semi-NMF for Each Version
+results_list <- list()
+
+for (version_name in names(version_list)) {
+  cat(sprintf("\n>>> Processing: %s\n", version_name))
+  cat(sprintf("    Started at: %s\n", Sys.time()))
+  
+  effect_mat <- version_list[[version_name]]
+  
+  # Set seed for reproducibility
+  set.seed(NMF_SEED)
+  
+  # Run NMF with rank estimation
+  tryCatch({
+    estim_r <- nmf(effect_mat, 
+                   rank = RANK_GRID, 
+                   method = semi_wrapper,
+                   mixed = TRUE,  # allows negative values in W
+                   nrun = NMF_NRUNS, 
+                   seed = NMF_SEED + 1, 
+                   maxiter = NMF_MAXITER,
+                   .options = "v")  # verbose
+    
+    # Save individual result
+    result_file <- file.path(OUTPUT_DIR, sprintf("estim_%s.rds", version_name))
+    saveRDS(estim_r, result_file)
+    cat(sprintf("    Saved: %s\n", result_file))
+    
+    # Store in list
+    results_list[[version_name]] <- estim_r
+    
+  }, error = function(e) {
+    cat(sprintf("    ERROR: %s\n", e$message))
+    results_list[[version_name]] <- NULL
+  })
+  
+  cat(sprintf("    Finished at: %s\n", Sys.time()))
+}
+
+# Save combined results
+saveRDS(results_list, file.path(OUTPUT_DIR, "all_estim_results.rds"))
+@
+
+>>> Processing: v1_zscore_masked
+    Started at: 2026-01-26 22:02:25.122842
+Compute NMF rank= 5  ... + measures ... OK
+Compute NMF rank= 6  ... + measures ... OK
+Compute NMF rank= 7  ... + measures ... OK
+Compute NMF rank= 8  ... + measures ... OK
+Compute NMF rank= 9  ... + measures ... OK
+Compute NMF rank= 10  ... + measures ... OK
+Compute NMF rank= 11  ... + measures ... OK
+Compute NMF rank= 12  ... + measures ... OK
+Compute NMF rank= 13  ... + measures ... OK
+Compute NMF rank= 14  ... + measures ... OK
+Compute NMF rank= 15  ... + measures ... OK
+Compute NMF rank= 16  ... + measures ... OK
+Compute NMF rank= 17  ... + measures ... OK
+Compute NMF rank= 18  ... + measures ... OK
+Compute NMF rank= 19  ... + measures ... OK
+Compute NMF rank= 20  ... + measures ... OK
+Compute NMF rank= 21  ... + measures ... OK
+Compute NMF rank= 22  ... + measures ... OK
+Compute NMF rank= 23  ... + measures ... OK
+Compute NMF rank= 24  ... + measures ... OK
+Compute NMF rank= 25  ... + measures ... OK
+    Saved: /home/ec2-user/scitoseq/results/semiNMF_comparison/estim_v1_zscore_masked.rds
+    Finished at: 2026-01-26 22:43:31.665934
+
+
+>>> Processing: v2_zscore_unmasked
+    Started at: 2026-01-26 22:43:31.666227
+Compute NMF rank= 5  ... + measures ... OK
+Compute NMF rank= 6  ... + measures ... OK
+Compute NMF rank= 7  ... + measures ... OK
+Compute NMF rank= 8  ... + measures ... OK
+Compute NMF rank= 9  ... + measures ... OK
+Compute NMF rank= 10  ... + measures ... OK
+Compute NMF rank= 11  ... + measures ... OK
+Compute NMF rank= 12  ... + measures ... OK
+Compute NMF rank= 13  ... + measures ... OK
+Compute NMF rank= 14  ... + measures ... OK
+Compute NMF rank= 15  ... + measures ... OK
+Compute NMF rank= 16  ... + measures ... OK
+Compute NMF rank= 17  ... + measures ... OK
+Compute NMF rank= 18  ... + measures ... OK
+Compute NMF rank= 19  ... + measures ... OK
+Compute NMF rank= 20  ... + measures ... OK
+Compute NMF rank= 21  ... + measures ... OK
+Compute NMF rank= 22  ... + measures ... OK
+Compute NMF rank= 23  ... + measures ... OK
+Compute NMF rank= 24  ... + measures ... OK
+Compute NMF rank= 25  ... + measures ... OK
+    Saved: /home/ec2-user/scitoseq/results/semiNMF_comparison/estim_v2_zscore_unmasked.rds
+    Finished at: 2026-01-26 23:24:05.837454
+    
+
+>>> Processing: v3_lfc_masked
+    Started at: 2026-01-26 23:24:05.83767
+Compute NMF rank= 5  ... + measures ... OK
+Compute NMF rank= 6  ... + measures ... OK
+Compute NMF rank= 7  ... + measures ... OK
+Compute NMF rank= 8  ... + measures ... OK
+Compute NMF rank= 9  ... + measures ... OK
+Compute NMF rank= 10  ... + measures ... OK
+Compute NMF rank= 11  ... + measures ... OK
+Compute NMF rank= 12  ... + measures ... OK
+Compute NMF rank= 13  ... + measures ... OK
+Compute NMF rank= 14  ... + measures ... OK
+Compute NMF rank= 15  ... + measures ... OK
+Compute NMF rank= 16  ... + measures ... OK
+Compute NMF rank= 17  ... + measures ... OK
+Compute NMF rank= 18  ... + measures ... OK
+Compute NMF rank= 19  ... + measures ... OK
+Compute NMF rank= 20  ... + measures ... OK
+Compute NMF rank= 21  ... + measures ... OK
+Compute NMF rank= 22  ... + measures ... OK
+Compute NMF rank= 23  ... + measures ... OK
+Compute NMF rank= 24  ... + measures ... OK
+Compute NMF rank= 25  ... + measures ... OK
+    Saved: /home/ec2-user/scitoseq/results/semiNMF_comparison/estim_v3_lfc_masked.rds
+    Finished at: 2026-01-27 00:05:32.673626
+    
+>>> Processing: v4_lfc_unmasked
+    Started at: 2026-01-27 00:05:32.673869
+Compute NMF rank= 5  ... + measures ... OK
+Compute NMF rank= 6  ... + measures ... OK
+Compute NMF rank= 7  ... + measures ... OK
+Compute NMF rank= 8  ... + measures ... OK
+Compute NMF rank= 9  ... + measures ... OK
+Compute NMF rank= 10  ... + measures ... OK
+Compute NMF rank= 11  ... + measures ... OK
+Compute NMF rank= 12  ... + measures ... OK
+Compute NMF rank= 13  ... + measures ... OK
+Compute NMF rank= 14  ... + measures ... OK
+Compute NMF rank= 15  ... + measures ... OK
+Compute NMF rank= 16  ... + measures ... OK
+Compute NMF rank= 17  ... + measures ... OK
+Compute NMF rank= 18  ... + measures ... OK
+Compute NMF rank= 19  ... + measures ... OK
+Compute NMF rank= 20  ... + measures ... OK
+Compute NMF rank= 21  ... + measures ... OK
+Compute NMF rank= 22  ... + measures ... OK
+Compute NMF rank= 23  ... + measures ... OK
+Compute NMF rank= 24  ... + measures ... OK
+Compute NMF rank= 25  ... + measures ... OK
+    Saved: /home/ec2-user/scitoseq/results/semiNMF_comparison/estim_v4_lfc_unmasked.rds
+    Finished at: 2026-01-27 00:46:53.800109
+
+<<>>=
+# version_list <- list(
+#   "v1_zscore_masked" = mat_v1,
+#   "v2_zscore_unmasked" = mat_v2,
+#   "v3_lfc_masked" = mat_v3,
+#   "v4_lfc_unmasked" = mat_v4
+# )
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/results/semiNMF_comparison"
+results_list <- readRDS(file.path(OUTPUT_DIR, "all_estim_results.rds"))
+print(results_list[[1]]) # v1_zscore_masked
+plot(results_list[[1]], main = "V1 zscore masked")
+
+print(results_list[[2]]) # v2_zscore_unmasked
+plot(results_list[[2]], main = "V2 zscore unmasked")
+
+print(results_list[[3]]) # v3_lfc_masked
+plot(results_list[[3]], main = "V3 lfc masked")
+
+print(results_list[[4]]) # v4_lfc_unmasked
+plot(results_list[[4]], main = "V4 lfc unmasked")
+
+# summary statistics
+for (version_name in names(results_list)) {
+  estim_r <- results_list[[version_name]]
+  
+  if (!is.null(estim_r)) {
+    cat(sprintf("\n%s:\n", version_name))
+    
+    # Extract metrics
+    if (inherits(estim_r, "NMF.rank")) {
+      # Get cophenetic correlation
+      coph <- estim_r$measures$cophenetic
+      disp <- estim_r$measures$dispersion
+      
+      # Find optimal rank (max cophenetic)
+      best_rank_coph <- RANK_GRID[which.max(coph)]
+      
+      cat(sprintf("  Best rank (cophenetic): %d (coph = %.3f)\n", 
+                  best_rank_coph, max(coph)))
+      cat(sprintf("  Cophenetic range: %.3f - %.3f\n", min(coph), max(coph)))
+      cat(sprintf("  Dispersion range: %.3f - %.3f\n", min(disp), max(disp)))
+    }
+  } else {
+    cat(sprintf("\n%s: FAILED\n", version_name))
+  }
+}
+@
+
+v1_zscore_masked:
+  Best rank (cophenetic): 5 (coph = 0.839)
+  Cophenetic range: 0.617 - 0.839
+  Dispersion range: 0.173 - 0.495
+
+v2_zscore_unmasked:
+  Best rank (cophenetic): 5 (coph = 0.848)
+  Cophenetic range: 0.634 - 0.848
+  Dispersion range: 0.168 - 0.482
+
+v3_lfc_masked:
+  Best rank (cophenetic): 5 (coph = 0.870)
+  Cophenetic range: 0.614 - 0.870
+  Dispersion range: 0.231 - 0.431
+
+v4_lfc_unmasked:
+  Best rank (cophenetic): 5 (coph = 0.852)
+  Cophenetic range: 0.607 - 0.852
+  Dispersion range: 0.266 - 0.511
+  
+  
+Cophenetic correlation measures the stability of the factorization across multiple runs. Higher values indicate more reproducible clustering — the sample assignments remain consistent when you rerun the algorithm with different initializations. This is often considered the most important metric for rank selection in NMF-type analyses.
+Dispersion quantifies the spread of entries in the consensus matrix. Higher dispersion means samples are more clearly assigned to one cluster versus another (entries closer to 0 or 1 rather than intermediate values). It complements cophenetic correlation as a stability measure.
+Explained variance (evar) is the fraction of total variance in the original data captured by the factorization. It increases monotonically with rank (more components = more variance explained), so on its own it always favors higher ranks.
+Residuals and RSS (residual sum of squares) both measure reconstruction error — how well W×H approximates the original matrix. Both decrease with increasing rank. Like evar, these always improve with more components, so you're looking for an "elbow" where improvement plateaus.
+Silhouette measures how well-separated the resulting clusters are. Higher silhouette scores (for coefficients/consensus) indicate that samples within each cluster are more similar to each other than to samples in other clusters. The coefficients (green) and consensus (purple) silhouettes can diverge.
+Sparseness measures how concentrated (sparse) the basis vectors and coefficients are. Sparser solutions are generally more interpretable, as each component captures a distinct, localized signal.
+
+
+-----
+
+semi-NMF Analysis: V1 Z-score Masked - Extended Rank Search & Validation
+<<>>=
+suppressPackageStartupMessages({
+  library(NMF)
+  library(hNMF)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+})
+
+# Paths
+GENE_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/results/semiNMF_v1_analysis"
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUTPUT_DIR, "figures"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUTPUT_DIR, "enrichment"), recursive = TRUE, showWarnings = FALSE)
+
+# Parameters
+FDR_THRESHOLD <- 0.1
+RANK_GRID <- 3:10
+NMF_NRUNS <- 20 #10
+NMF_MAXITER <- 500  # Increased for better convergence
+NMF_SEED <- 42
+
+
+cat(sprintf("Rank grid: %d to %d\n", min(RANK_GRID), max(RANK_GRID))) 
+# Rank grid: 3 to 10
+cat(sprintf("Runs per rank: %d\n", NMF_NRUNS))
+# Runs per rank: 20
+cat(sprintf("Max iterations: %d\n", NMF_MAXITER))
+# Max iterations: 500
+cat(sprintf("Output directory: %s\n", OUTPUT_DIR))
+
+# Load Data
+gene_zscore_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_zscore_mat.rds"))
+gene_lfc_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_lfc_mat.rds"))
+gene_qval_per_protein <- readRDS(file.path(GENE_RESULTS_DIR, "gene_qval_per_protein.rds"))
+self_targeted_gene <- readRDS(file.path(GENE_RESULTS_DIR, "self_targeted_gene.rds"))
+
+cat(sprintf("  Z-score matrix: %d genes × %d proteins\n", nrow(gene_zscore_mat), ncol(gene_zscore_mat)))
+# Z-score matrix: 17336 genes × 201 proteins
+
+
+# Gene Filtering: Per-protein FDR < 0.1
+gene_min_qval <- apply(gene_qval_per_protein, 1, min, na.rm = TRUE)
+genes_filtered <- names(gene_min_qval)[gene_min_qval < FDR_THRESHOLD]
+
+cat(sprintf("  Genes passing filter: %d\n", length(genes_filtered)))
+# 2848
+
+# Prepare V1 Input Matrix: Z-score, Cis-masked
+# Subset to filtered genes
+mat_v1 <- gene_zscore_mat[genes_filtered, , drop = FALSE]
+
+# Mask cis-pairs (set to 0)
+n_masked <- 0
+for (i in 1:nrow(self_targeted_gene)) {
+  gene <- self_targeted_gene$gene[i]
+  protein <- self_targeted_gene$protein[i]
+  if (gene %in% rownames(mat_v1) && protein %in% colnames(mat_v1)) {
+    mat_v1[gene, protein] <- 0
+    n_masked <- n_masked + 1
+  }
+}
+cat(sprintf("  Masked %d cis-pairs\n", n_masked))
+
+# Clean matrix (handle NA/Inf)
+mat_v1[is.na(mat_v1)] <- 0
+mat_v1[!is.finite(mat_v1)] <- 0
+
+cat(sprintf("  Final dimensions: %d genes × %d proteins\n", nrow(mat_v1), ncol(mat_v1)))
+cat(sprintf("  Value range: [%.2f, %.2f]\n", min(mat_v1), max(mat_v1)))
+# Final dimensions: 2848 genes × 201 proteins
+# Value range: [-17.34, 9.82]
+
+# Save input matrix
+saveRDS(mat_v1, file.path(OUTPUT_DIR, "input_matrix_v1.rds"))
+saveRDS(genes_filtered, file.path(OUTPUT_DIR, "genes_filtered.rds"))
+@
+
+<<>>=
+semi_wrapper <- function(x, seed, maxiter = 800, ...) {
+  current_rank <- nbasis(seed)
+  
+  # Initialize with improved values
+  H_improved <- matrix(runif(current_rank * ncol(x), 0.01, 1), 
+                       nrow = current_rank, ncol = ncol(x))
+  W_improved <- matrix(rnorm(nrow(x) * current_rank), 
+                       nrow = nrow(x), ncol = current_rank)
+  
+  NMF::basis(seed) <- W_improved
+  NMF::coef(seed) <- H_improved
+  
+  # Test invertibility
+
+  H_test <- try(MASS::ginv(NMF::coef(seed)), silent = TRUE)
+  if (inherits(H_test, "try-error")) {
+    warning("H matrix may be problematic for semi-NMF")
+  }
+  
+  result <- hNMF::semiNMF(X = x, nmfMod = seed, 
+                          maxiter = maxiter, checkDivergence = FALSE)
+  return(result)
+}
+
+# Run Semi-NMF with Extended Rank Search
+set.seed(NMF_SEED)
+t_start <- Sys.time()
+
+estim_v1 <- nmf(mat_v1, 
+                rank = RANK_GRID, 
+                method = semi_wrapper,
+                mixed = TRUE,
+                nrun = NMF_NRUNS, 
+                seed = NMF_SEED + 1, 
+                maxiter = NMF_MAXITER,
+                .options = "v")
+
+t_elapsed <- difftime(Sys.time(), t_start, units = "mins")
+cat(sprintf("\nCompleted in %.1f minutes\n", as.numeric(t_elapsed)))
+
+# Save estimation results
+saveRDS(estim_v1, file.path(OUTPUT_DIR, "estim_v1_k3to10.rds"))
+
+estim_v1 <- readRDS(file.path(OUTPUT_DIR, "estim_v1_k3to10.rds"))
+plot(estim_v1, main = "V1 zscore masked")
+@
+
+\end{document}

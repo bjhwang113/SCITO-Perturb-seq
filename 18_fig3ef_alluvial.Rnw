@@ -1,0 +1,608 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+<<>>=
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggalluvial)
+})
+set.seed(42)
+
+GENE_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+CORR_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_correlation"
+NMF_DIR          <- "/home/ec2-user/scitoseq/results/semiNMF_v1_analysis"
+OUTPUT_DIR       <- "/home/ec2-user/scitoseq/results/bridge/"
+fig_dir <-  "/home/ec2-user/scitoseq/fig/fig3/"
+
+modules <- paste0("M", 1:5)
+MODULE_NAMES_SHORT <- c(
+  M1 = "Adhesion & Immune Reg.", M2 = "Tissue / Innate-like",
+  M3 = "Resting / Naive", M4 = "Activation / Prolif.", M5 = "Effector / Exhaustion"
+)
+MODULE_COLORS <- c(
+  M1 = "#da7901", M2 = "#20235b", M3 = "#637b31", M4 = "#7B2D8E", M5 = "#f0be3d"
+)
+CLUSTER_ANNOTATIONS <- c(
+  "1" = "abc transporters", "2" = "calcineurin mediated signaling",
+  "3" = "calcineurin signaling",
+  "4" = "regulation of calcium ion transmembrane transport",
+  "5" = "immunoregulatory interactions", "6" = "detoxification",
+  "7" = "TNF receptor signaling", "8" = "t cell receptor signaling pathway",
+  "9" = "protein localization to cell periphery",
+  "10" = "regulation of bmp signaling pathway"
+)
+
+# DATA LOADING AND PROCESSING
+
+gene_zscore_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_zscore_mat.rds"))
+gene_qval_mat   <- readRDS(file.path(GENE_RESULTS_DIR, "gene_qval_per_protein.rds"))
+self_targeted    <- readRDS(file.path(GENE_RESULTS_DIR, "self_targeted_gene.rds"))
+prot_cluster_df  <- readRDS(file.path(CORR_RESULTS_DIR, "protein_clusters.rds"))
+model_k5         <- readRDS(file.path(NMF_DIR, "model_k5.rds"))
+
+W_raw <- model_k5$W; H_raw <- model_k5$H
+colnames(W_raw) <- modules; rownames(H_raw) <- modules
+
+# L2-normalize W and H
+d <- sqrt(colSums(W_raw^2))
+W <- sweep(W_raw, 2, d, "/")
+H <- diag(d) %*% H_raw
+rownames(H) <- modules; colnames(H) <- colnames(H_raw)
+
+# Reproduce gene clusters (k=10, Ward.D2)
+genes_filtered <- names(which(rowSums(gene_qval_mat < 0.10, na.rm = TRUE) >= 3))
+gene_zscore_masked <- gene_zscore_mat
+for (i in seq_len(nrow(self_targeted))) {
+  g <- self_targeted$gene[i]; p <- self_targeted$protein[i]
+  if (g %in% rownames(gene_zscore_masked) && p %in% colnames(gene_zscore_masked))
+    gene_zscore_masked[g, p] <- NA
+}
+zscore_clust <- gene_zscore_masked[genes_filtered, , drop = FALSE]
+zscore_clust[is.na(zscore_clust) | !is.finite(zscore_clust)] <- 0
+corr_mat <- cor(t(zscore_clust), method = "pearson", use = "pairwise.complete.obs")
+corr_mat[is.na(corr_mat)] <- 0
+gene_clusters <- cutree(hclust(as.dist(1 - corr_mat), method = "ward.D2"), k = 10)
+
+# Dominant module assignments
+gene_dom_module <- modules[apply(abs(W), 1, which.max)]
+names(gene_dom_module) <- rownames(W)
+prot_dom_module <- modules[apply(H, 2, which.max)]
+names(prot_dom_module) <- colnames(H)
+
+# Bridge data frames
+genes_both <- intersect(names(gene_clusters), rownames(W))
+cluster_vec <- gene_clusters[genes_both]
+W_bridge <- W[genes_both, ]
+
+proteins_in_H <- colnames(H)
+protein_groups <- sort(unique(prot_cluster_df$cluster_name))
+
+prot_bridge <- data.frame(
+  protein = proteins_in_H,
+  group = prot_cluster_df$cluster_name[match(proteins_in_H, prot_cluster_df$protein)],
+  dom_module = prot_dom_module,
+  stringsAsFactors = FALSE
+) %>% filter(!is.na(group))
+
+cat(sprintf("Genes in bridge: %d | Proteins in bridge: %d\n\n",
+            length(genes_both), nrow(prot_bridge)))
+@
+
+<<>>=
+# STATISTICAL TESTS - GENE SIDE
+
+# --- Permutation test (global) ---
+compute_cluster_module_mat <- function(clusters, W_mat) {
+  k <- max(clusters)
+  mat <- matrix(NA, nrow = k, ncol = ncol(W_mat))
+  for (cl in 1:k) {
+    idx <- which(clusters == cl)
+    if (length(idx) > 0) mat[cl, ] <- colMeans(W_mat[idx, , drop = FALSE])
+  }
+  mat
+}
+
+obs_mat <- compute_cluster_module_mat(cluster_vec, W_bridge)
+obs_frob <- sqrt(sum(obs_mat^2))
+
+N_PERM <- 10000
+perm_frob <- numeric(N_PERM)
+perm_cluster_norms <- matrix(0, nrow = N_PERM, ncol = 10)
+
+cat(sprintf("Running %d permutations (gene side)...\n", N_PERM))
+for (i in 1:N_PERM) {
+  shuffled <- sample(cluster_vec)
+  perm_mat <- compute_cluster_module_mat(shuffled, W_bridge)
+  perm_frob[i] <- sqrt(sum(perm_mat^2))
+  perm_cluster_norms[i, ] <- rowSums(perm_mat^2)
+}
+
+perm_p <- (sum(perm_frob >= obs_frob) + 1) / (N_PERM + 1)
+cat(sprintf("Global permutation test: Z = %.1f, P = %.2e\n",
+            (obs_frob - mean(perm_frob)) / sd(perm_frob), perm_p))
+
+# --- Per-cluster permutation test ---
+obs_cluster_norms <- rowSums(obs_mat^2)
+cluster_pvals <- sapply(1:10, function(cl) {
+  (sum(perm_cluster_norms[, cl] >= obs_cluster_norms[cl]) + 1) / (N_PERM + 1)
+})
+cluster_pvals_adj <- p.adjust(cluster_pvals, method = "BH")
+n_sig_clusters <- sum(cluster_pvals_adj < 0.05)
+cat(sprintf("Clusters with non-random module profiles: %d/10 (BH P < 0.05)\n", n_sig_clusters))
+
+# --- Fisher's exact test (gene cluster x module) ---
+gene_dom_bridge <- gene_dom_module[genes_both]
+
+fisher_gene <- expand.grid(cluster = 1:10, module = modules, stringsAsFactors = FALSE) %>%
+  rowwise() %>%
+  mutate(
+    a = sum(cluster_vec == cluster & gene_dom_bridge == module),
+    b = sum(cluster_vec != cluster & gene_dom_bridge == module),
+    c = sum(cluster_vec == cluster & gene_dom_bridge != module),
+    d = sum(cluster_vec != cluster & gene_dom_bridge != module),
+    fisher_p = fisher.test(matrix(c(a, b, c, d), nrow = 2))$p.value,
+    odds_ratio = fisher.test(matrix(c(a, b, c, d), nrow = 2))$estimate
+  ) %>%
+  ungroup() %>%
+  mutate(padj = p.adjust(fisher_p, method = "BH"),
+         cluster_label = paste0("C", cluster))
+
+cat("\nSignificant gene cluster-module associations (FDR < 0.05):\n")
+fisher_gene %>% filter(padj < 0.05) %>% arrange(padj) %>%
+  select(cluster_label, module, a, odds_ratio, padj) %>%
+  print(n = 20)
+
+# STATISTICAL TESTS - PROTEIN SIDE
+fisher_prot <- expand.grid(group = protein_groups, module = modules,
+                            stringsAsFactors = FALSE) %>%
+  rowwise() %>%
+  mutate(
+    a = sum(prot_bridge$group == group & prot_bridge$dom_module == module),
+    b = sum(prot_bridge$group != group & prot_bridge$dom_module == module),
+    c = sum(prot_bridge$group == group & prot_bridge$dom_module != module),
+    d = sum(prot_bridge$group != group & prot_bridge$dom_module != module),
+    fisher_p = fisher.test(matrix(c(a, b, c, d), nrow = 2))$p.value,
+    odds_ratio = fisher.test(matrix(c(a, b, c, d), nrow = 2))$estimate
+  ) %>%
+  ungroup() %>%
+  mutate(padj = p.adjust(fisher_p, method = "BH"))
+
+cat("\nSignificant protein group-module associations (FDR < 0.05):\n")
+fisher_prot %>% filter(padj < 0.05) %>% arrange(padj) %>%
+  select(group, module, a, odds_ratio, padj) %>%
+  print(n = 20)
+
+# Cross-tabs for reference
+cat("\nProtein group x module cross-tab (row %):\n")
+print(round(prop.table(table(prot_bridge$group, prot_bridge$dom_module), margin = 1) * 100, 1))
+
+cat("\nGene cluster x module cross-tab (row %):\n")
+gene_cross <- table(
+  Cluster = paste0("C", cluster_vec),
+  Module = gene_dom_bridge)
+print(round(prop.table(gene_cross, margin = 1) * 100, 1))
+@
+
+<<>>=
+# ALLUVIAL PLOTS
+
+# Shared data for alluvial plots
+gene_flow <- data.frame(
+  gene = genes_both,
+  cluster_label = factor(paste0("C", cluster_vec), levels = paste0("C", 1:10)),
+  module_label = factor(gene_dom_bridge, levels = modules),
+  stringsAsFactors = FALSE
+) %>%
+  group_by(cluster_label, module_label) %>%
+  summarise(gene_count = n(), .groups = "drop")
+
+module_protgroup_frac <- expand.grid(module = modules, group = protein_groups,
+                                      stringsAsFactors = FALSE) %>%
+  rowwise() %>%
+  mutate(frac = {
+    grp_prots <- intersect(
+      prot_cluster_df$protein[prot_cluster_df$cluster_name == group], proteins_in_H
+    )
+    if (length(grp_prots) > 0) sum(H[module, grp_prots]) / sum(H[module, ]) else 0
+  }) %>%
+  ungroup()
+
+# --- Shared theme ---
+alluvial_theme <- theme_minimal(base_size = 16) +
+  theme(
+    axis.text.y   = element_blank(),
+    axis.text.x = element_text(size = 16),
+    axis.ticks.y  = element_blank(),
+    panel.grid    = element_blank(),
+    plot.title    = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 9, hjust = 0.5, color = "grey40"),
+    plot.margin   = margin(10, 15, 10, 15)
+  )
+
+# --- Shared strata fill (grey for non-module, module colors for modules) ---
+all_strata <- c(paste0("C", 1:10), modules, protein_groups)
+strata_fill <- setNames(
+  c(rep("grey75", 10), unname(MODULE_COLORS), rep("grey75", length(protein_groups))),
+  all_strata
+)
+
+# PLOT 1: Joint 3-column alluvial (Gene Clusters -> Modules -> Protein Groups)
+unified_3col <- gene_flow %>%
+  left_join(module_protgroup_frac,
+            by = c("module_label" = "module"),
+            relationship = "many-to-many") %>%
+  mutate(flow_count = gene_count * frac,
+         group_label = factor(group, levels = protein_groups)) %>%
+  filter(flow_count > 0.5)
+
+p_joint <- ggplot(unified_3col,
+                  aes(axis1 = cluster_label, axis2 = module_label,
+                      axis3 = group_label, y = flow_count)) +
+  geom_alluvium(aes(fill = module_label), width = 1/4, alpha = 0.55,
+                curve_type = "sigmoid") +
+  geom_stratum(aes(fill = after_stat(stratum)), width = 1/4,
+               color = "grey40", linewidth = 0.3) +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 4) +
+  scale_fill_manual(values = c(MODULE_COLORS, strata_fill), guide = "none") +
+  scale_x_discrete(
+    limits = c("Gene Cluster\n(Fig 2E)", "Phenotypic Module\n(Fig 3)",
+               "Protein Group\n(Fig 2A)"),
+    expand = c(0.12, 0.05)
+  ) +
+  labs(title = "Gene Clusters \u2192 Phenotypic Modules \u2192 Protein Groups",
+       subtitle = "Flow colored by phenotypic module; width proportional to gene count \u00d7 H signature fraction",
+       y = NULL) +
+  alluvial_theme
+p_joint
+ggsave(file.path(fig_dir, "bridge_alluvial_joint.pdf"),
+       p_joint, width = 11, height = 9)
+# ggsave(file.path(OUTPUT_DIR, "bridge_alluvial_joint.png"),
+#        p_joint, width = 11, height = 9, dpi = 300)
+
+# PLOT 2: Gene Cluster -> Module (separate)
+p_gene <- ggplot(gene_flow,
+                 aes(axis1 = cluster_label, axis2 = module_label,
+                     y = gene_count)) +
+  geom_alluvium(aes(fill = module_label), width = 1/4, alpha = 0.55,
+                curve_type = "sigmoid") +
+  geom_stratum(aes(fill = after_stat(stratum)), width = 1/4,
+               color = "grey40", linewidth = 0.3) +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 6) +
+  scale_fill_manual(
+    values = c(MODULE_COLORS, setNames(rep("grey75", 10), paste0("C", 1:10))),
+    guide = "none"
+  ) +
+  scale_x_discrete(
+    limits = c("Gene Cluster\n(Fig 2E)", "Phenotypic Module\n(Fig 3)"),
+    expand = c(0.2, 0.05)
+  ) +
+  labs(title = "Gene Cluster \u2192 Phenotypic Module Assignment",
+       subtitle = sprintf("%d genes, assigned to dominant module by max|W|", length(genes_both)),
+       y = "Number of genes") +
+  alluvial_theme
+p_gene
+ggsave(file.path(fig_dir, "bridge_alluvial_gene.pdf"),
+       p_gene, width = 8, height = 9)
+# ggsave(file.path(OUTPUT_DIR, "bridge_alluvial_gene.png"),
+#        p_gene, width = 8, height = 9, dpi = 300)
+
+# PLOT 3: Module -> Protein Group (separate)
+prot_flow <- prot_bridge %>%
+  mutate(module_label = factor(dom_module, levels = modules),
+         group_label = factor(group, levels = protein_groups)) %>%
+  group_by(module_label, group_label) %>%
+  summarise(prot_count = n(), .groups = "drop")
+
+p_prot <- ggplot(prot_flow,
+                 aes(axis1 = module_label, axis2 = group_label,
+                     y = prot_count)) +
+  geom_alluvium(aes(fill = module_label), width = 1/4, alpha = 0.55,
+                curve_type = "sigmoid") +
+  geom_stratum(aes(fill = after_stat(stratum)), width = 1/4,
+               color = "grey40", linewidth = 0.3) +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 6) +
+  scale_fill_manual(
+    values = c(MODULE_COLORS, setNames(rep("grey75", length(protein_groups)), protein_groups)),
+    guide = "none"
+  ) +
+  scale_x_discrete(
+    limits = c("Phenotypic Module\n(Fig 3)", "Protein Group\n(Fig 2A)"),
+    expand = c(0.2, 0.05)
+  ) +
+  labs(title = "Phenotypic Module \u2192 Protein Group Assignment",
+       subtitle = sprintf("%d proteins, assigned to dominant module by max(H)", nrow(prot_bridge)),
+       y = "Number of proteins") +
+  alluvial_theme
+p_prot
+ggsave(file.path(fig_dir, "bridge_alluvial_protein.pdf"),
+       p_prot, width = 8, height = 9)
+# ggsave(file.path(OUTPUT_DIR, "bridge_alluvial_protein.png"),
+#        p_prot, width = 8, height = 9, dpi = 300)
+@
+
+<<>>=
+# SUPPLEMENTARY TABLES
+write.csv(
+  fisher_gene %>%
+    select(cluster_label, module, a, odds_ratio, fisher_p, padj) %>%
+    rename(n_genes = a),
+  file.path(OUTPUT_DIR, "/bridge/bridge_fisher_gene_cluster_module.csv"), row.names = FALSE
+)
+
+write.csv(
+  fisher_prot %>%
+    select(group, module, a, odds_ratio, fisher_p, padj) %>%
+    rename(n_proteins = a),
+  file.path(OUTPUT_DIR, "bridge_fisher_protgroup_module.csv"), row.names = FALSE
+)
+
+gene_cross_tab <- data.frame(gene = genes_both, cluster = paste0("C", cluster_vec),
+                              module = gene_dom_bridge) %>%
+  group_by(cluster, module) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(cluster) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  mutate(label = paste0(n, " (", pct, "%)")) %>%
+  select(cluster, module, label) %>%
+  pivot_wider(names_from = module, values_from = label, values_fill = "0 (0%)")
+
+write.csv(gene_cross_tab,
+          file.path(OUTPUT_DIR, "bridge_gene_cluster_module_crosstab.csv"), row.names = FALSE)
+
+prot_cross_tab <- prot_bridge %>%
+  group_by(group, dom_module) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(group) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  mutate(label = paste0(n, " (", pct, "%)")) %>%
+  select(group, dom_module, label) %>%
+  pivot_wider(names_from = dom_module, values_from = label, values_fill = "0 (0%)")
+
+write.csv(prot_cross_tab,
+          file.path(OUTPUT_DIR, "bridge_protgroup_module_crosstab.csv"), row.names = FALSE)
+@
+
+<<>>=
+cat(sprintf("Gene side: %d genes, %d clusters, %d modules\n",
+            length(genes_both), 10, 5))
+cat(sprintf("  Global permutation: Z = %.1f, P < %.0e\n",
+            (obs_frob - mean(perm_frob)) / sd(perm_frob),
+            10^ceiling(log10(perm_p))))
+cat(sprintf("  Clusters with non-random profiles: %d/10\n", n_sig_clusters))
+
+cat(sprintf("\nProtein side: %d proteins, %d groups, %d modules\n",
+            nrow(prot_bridge), length(protein_groups), 5))
+cat("  Top positive enrichments:\n")
+fisher_prot %>%
+  filter(padj < 0.05, odds_ratio > 1) %>%
+  arrange(padj) %>%
+  head(6) %>%
+  rowwise() %>%
+  mutate(msg = sprintf("    %s -> %s: %d/%d (OR=%.1f, FDR=%.1e)",
+                        group, module, a, a + c, odds_ratio, padj)) %>%
+  pull(msg) %>%
+  cat(sep = "\n")
+@
+
+Gene side: 299 genes, 10 clusters, 5 modules
+Global permutation: Z = 17.7, P < 1e-04
+Clusters with non-random profiles: 7/10
+Protein side: 201 proteins, 5 groups, 5 modules
+  Top positive enrichments:
+  Activation -> M4: 28/42 (OR=41.8, FDR=3.5e-16)
+  Innate-like -> M3: 47/57 (OR=15.5, FDR=7.9e-14)
+  Adhesion -> M1: 27/39 (OR=10.6, FDR=5.2e-09)
+  Identity -> M1: 20/24 (OR=19.9, FDR=6.6e-09)
+  Cytokine/Chemokine -> M3: 29/39 (OR=6.2, FDR=6.5e-06)
+  Cytokine/Chemokine -> M5: 9/39 (OR=7.7, FDR=7.2e-04)
+
+
+<<>>=
+# Reproduce gene clusters
+genes_filtered <- names(which(rowSums(gene_qval_mat < 0.10, na.rm = TRUE) >= 3))
+gene_zscore_masked <- gene_zscore_mat
+for (i in seq_len(nrow(self_targeted))) {
+  g <- self_targeted$gene[i]; p <- self_targeted$protein[i]
+  if (g %in% rownames(gene_zscore_masked) && p %in% colnames(gene_zscore_masked))
+    gene_zscore_masked[g, p] <- NA
+}
+zscore_clust <- gene_zscore_masked[genes_filtered, , drop = FALSE]
+zscore_clust[is.na(zscore_clust) | !is.finite(zscore_clust)] <- 0
+corr_mat <- cor(t(zscore_clust), method = "pearson", use = "pairwise.complete.obs")
+corr_mat[is.na(corr_mat)] <- 0
+gene_clusters <- cutree(hclust(as.dist(1 - corr_mat), method = "ward.D2"), k = 10)
+
+genes_both <- intersect(names(gene_clusters), rownames(W))
+proteins_in_H <- colnames(H)
+@
+
+UNIFIED TEST: Between-group sum of squares, permutation-based
+
+For each module m, compute:
+  SS_between(m) = sum_g [ n_g * (mean_gm - grand_mean_m)^2 ]
+
+Test statistic = sum over all modules of SS_between(m)
+This is equivalent to the trace of the between-group SSCP matrix
+(i.e., Pillai's trace in MANOVA, without normalization)
+
+Null: permute group labels among items, recompute.
+
+<<>>=
+compute_between_ss <- function(values_mat, group_labels) {
+  # values_mat: items x modules
+  # group_labels: vector of group labels (same length as nrow)
+  groups <- unique(group_labels)
+  grand_means <- colMeans(values_mat)
+  ss <- 0
+  for (g in groups) {
+    idx <- which(group_labels == g)
+    n_g <- length(idx)
+    group_means <- colMeans(values_mat[idx, , drop = FALSE])
+    ss <- ss + n_g * sum((group_means - grand_means)^2)
+  }
+  ss
+}
+
+N_PERM <- 10000
+
+# GENE SIDE: cluster labels permuted among 299 genes, tested on W matrix
+cat("=== GENE SIDE (continuous W coefficients) ===\n\n")
+
+W_bridge <- W[genes_both, ]
+cluster_vec <- gene_clusters[genes_both]
+
+obs_ss_gene <- compute_between_ss(W_bridge, cluster_vec)
+cat(sprintf("Observed between-cluster SS: %.8f\n", obs_ss_gene))
+
+perm_ss_gene <- numeric(N_PERM)
+cat(sprintf("Running %d permutations...\n", N_PERM))
+for (i in 1:N_PERM) {
+  perm_ss_gene[i] <- compute_between_ss(W_bridge, sample(cluster_vec))
+}
+
+perm_p_gene <- (sum(perm_ss_gene >= obs_ss_gene) + 1) / (N_PERM + 1)
+z_gene <- (obs_ss_gene - mean(perm_ss_gene)) / sd(perm_ss_gene)
+
+cat(sprintf("Null mean: %.8f, SD: %.8f\n", mean(perm_ss_gene), sd(perm_ss_gene)))
+cat(sprintf("Z-score: %.1f\n", z_gene))
+cat(sprintf("P-value: %.2e\n\n", perm_p_gene))
+
+# Per-cluster test: is each cluster's mean W vector further from grand mean than expected?
+cat("--- Per-cluster tests ---\n")
+grand_means_W <- colMeans(W_bridge)
+
+obs_cluster_ss <- sapply(1:10, function(cl) {
+  idx <- which(cluster_vec == cl)
+  n_g <- length(idx)
+  group_means <- colMeans(W_bridge[idx, , drop = FALSE])
+  n_g * sum((group_means - grand_means_W)^2)
+})
+
+perm_cluster_ss <- matrix(0, nrow = N_PERM, ncol = 10)
+for (i in 1:N_PERM) {
+  shuffled <- sample(cluster_vec)
+  for (cl in 1:10) {
+    idx <- which(shuffled == cl)
+    n_g <- length(idx)
+    group_means <- colMeans(W_bridge[idx, , drop = FALSE])
+    perm_cluster_ss[i, cl] <- n_g * sum((group_means - grand_means_W)^2)
+  }
+}
+
+cluster_pvals <- sapply(1:10, function(cl) {
+  (sum(perm_cluster_ss[, cl] >= obs_cluster_ss[cl]) + 1) / (N_PERM + 1)
+})
+cluster_padj <- p.adjust(cluster_pvals, method = "BH")
+
+gene_cluster_results <- data.frame(
+  cluster = paste0("C", 1:10),
+  n_genes = as.integer(table(cluster_vec)),
+  obs_SS = signif(obs_cluster_ss, 4),
+  null_mean = signif(colMeans(perm_cluster_ss), 4),
+  z_score = round((obs_cluster_ss - colMeans(perm_cluster_ss)) /
+                    apply(perm_cluster_ss, 2, sd), 2),
+  pval = signif(cluster_pvals, 3),
+  padj = signif(cluster_padj, 3)
+)
+print(gene_cluster_results)
+cat(sprintf("\nClusters with non-random module profiles (BH P < 0.05): %d/10\n",
+            sum(cluster_padj < 0.05)))
+
+# PROTEIN SIDE: protein group labels permuted among 201 proteins, tested on H
+cat("\n=== PROTEIN SIDE (continuous H protein signatures) ===\n\n")
+
+# H is modules x proteins, we need proteins x modules
+H_t <- t(H)  # 201 proteins x 5 modules
+prot_group_vec <- prot_cluster_df$cluster_name[match(proteins_in_H, prot_cluster_df$protein)]
+names(prot_group_vec) <- proteins_in_H
+
+# Remove any proteins without group assignment
+valid <- !is.na(prot_group_vec)
+H_bridge <- H_t[valid, ]
+prot_groups_vec <- prot_group_vec[valid]
+
+cat(sprintf("Proteins with group assignment: %d\n", sum(valid)))
+cat(sprintf("Protein groups: %s\n", paste(sort(unique(prot_groups_vec)), collapse = ", ")))
+
+obs_ss_prot <- compute_between_ss(H_bridge, prot_groups_vec)
+cat(sprintf("Observed between-group SS: %.2f\n", obs_ss_prot))
+
+perm_ss_prot <- numeric(N_PERM)
+cat(sprintf("Running %d permutations...\n", N_PERM))
+for (i in 1:N_PERM) {
+  perm_ss_prot[i] <- compute_between_ss(H_bridge, sample(prot_groups_vec))
+}
+
+perm_p_prot <- (sum(perm_ss_prot >= obs_ss_prot) + 1) / (N_PERM + 1)
+z_prot <- (obs_ss_prot - mean(perm_ss_prot)) / sd(perm_ss_prot)
+
+cat(sprintf("Null mean: %.2f, SD: %.2f\n", mean(perm_ss_prot), sd(perm_ss_prot)))
+cat(sprintf("Z-score: %.1f\n", z_prot))
+cat(sprintf("P-value: %.2e\n\n", perm_p_prot))
+
+# Per-group test
+cat("--- Per-group tests ---\n")
+protein_groups <- sort(unique(prot_groups_vec))
+grand_means_H <- colMeans(H_bridge)
+
+obs_group_ss <- sapply(protein_groups, function(grp) {
+  idx <- which(prot_groups_vec == grp)
+  n_g <- length(idx)
+  group_means <- colMeans(H_bridge[idx, , drop = FALSE])
+  n_g * sum((group_means - grand_means_H)^2)
+})
+
+perm_group_ss <- matrix(0, nrow = N_PERM, ncol = length(protein_groups))
+for (i in 1:N_PERM) {
+  shuffled <- sample(prot_groups_vec)
+  for (j in seq_along(protein_groups)) {
+    grp <- protein_groups[j]
+    idx <- which(shuffled == grp)
+    n_g <- length(idx)
+    group_means <- colMeans(H_bridge[idx, , drop = FALSE])
+    perm_group_ss[i, j] <- n_g * sum((group_means - grand_means_H)^2)
+  }
+}
+
+group_pvals <- sapply(seq_along(protein_groups), function(j) {
+  (sum(perm_group_ss[, j] >= obs_group_ss[j]) + 1) / (N_PERM + 1)
+})
+group_padj <- p.adjust(group_pvals, method = "BH")
+
+prot_group_results <- data.frame(
+  group = protein_groups,
+  n_proteins = as.integer(table(prot_groups_vec)[protein_groups]),
+  obs_SS = signif(obs_group_ss, 4),
+  null_mean = signif(colMeans(perm_group_ss), 4),
+  z_score = round((obs_group_ss - colMeans(perm_group_ss)) /
+                    apply(perm_group_ss, 2, sd), 2),
+  pval = signif(group_pvals, 3),
+  padj = signif(group_padj, 3)
+)
+print(prot_group_results)
+cat(sprintf("\nGroups with non-random module profiles (BH P < 0.05): %d/%d\n",
+            sum(group_padj < 0.05), length(protein_groups)))
+
+
+cat(sprintf("GENE SIDE: %d genes, 10 clusters\n", length(genes_both)))
+cat(sprintf("  Global: Z = %.1f, P %s\n", z_gene,
+            ifelse(perm_p_gene < 1e-4,
+                   paste0("< ", format(1/(N_PERM+1), scientific = TRUE)),
+                   paste0("= ", format(perm_p_gene, scientific = TRUE)))))
+cat(sprintf("  Individual clusters significant: %d/10 (BH P < 0.05)\n\n",
+            sum(cluster_padj < 0.05)))
+
+cat(sprintf("PROTEIN SIDE: %d proteins, 5 groups\n", sum(valid)))
+cat(sprintf("  Global: Z = %.1f, P %s\n", z_prot,
+            ifelse(perm_p_prot < 1e-4,
+                   paste0("< ", format(1/(N_PERM+1), scientific = TRUE)),
+                   paste0("= ", format(perm_p_prot, scientific = TRUE)))))
+cat(sprintf("  Individual groups significant: %d/%d (BH P < 0.05)\n",
+            sum(group_padj < 0.05), length(protein_groups)))
+@
+
+\end{document}

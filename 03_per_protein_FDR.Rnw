@@ -1,0 +1,204 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+<<>>=
+# FDR COMPARISON ANALYSIS: Global vs Per-Gene vs Per-Protein
+
+# This script computes:
+# 1. Per-gene FDR (BH across 201 proteins for each gene)
+# 2. Per-protein FDR (BH across 17,336 genes for each protein)
+# 3. Compares gene selection under different FDR strategies
+# 4. Generates heatmaps using each selection strategy
+# Key insight: Per-protein FDR is most biologically interpretable because
+# it asks "which genes regulate THIS protein" - a natural question.
+# Per-gene FDR has only 201 tests, making the correction very weak.
+library(ggplot2)
+
+# Parameters (consistent with main analysis)
+ZSCORE_CAP <- 5
+FDR_THRESHOLD <- 0.10
+
+# Load Data
+results_dir <- "/home/ec2-user/scitoseq/results/results_gene_level"
+sgrna_dir <- "/home/ec2-user/scitoseq/results/results_sgrna_level"
+
+gene_lfc_mat <- readRDS(file.path(results_dir, "gene_lfc_mat.rds"))
+gene_se_mat <- readRDS(file.path(results_dir, "gene_se_mat.rds"))
+gene_zscore_mat <- readRDS(file.path(results_dir, "gene_zscore_mat.rds"))
+gene_pval_mat <- readRDS(file.path(results_dir, "gene_pval_mat.rds"))
+# ncells_per_gene <- readRDS(file.path(results_dir, "gene_ncells.rds"))
+# self_targeted_gene <- readRDS(file.path(results_dir, "self_targeted_gene.rds"))
+# hits_df <- readRDS(file.path(results_dir, "all_hits_df.rds"))
+
+
+# SECTION 2: COMPUTE PER-GENE FDR (Row-wise BH)
+
+# For each gene (row), apply BH correction across 201 proteins
+gene_qval_per_gene <- t(apply(gene_pval_mat, 1, function(pvals) {
+  p.adjust(pvals, method = "BH")
+}))
+
+# Preserve dimension names
+rownames(gene_qval_per_gene) <- rownames(gene_pval_mat)
+colnames(gene_qval_per_gene) <- colnames(gene_pval_mat)
+
+cat(sprintf("Per-gene FDR matrix: %d × %d\n", 
+            nrow(gene_qval_per_gene), ncol(gene_qval_per_gene)))
+
+# Count significant per gene
+n_sig_per_gene <- rowSums(gene_qval_per_gene < FDR_THRESHOLD, na.rm = TRUE)
+cat(sprintf("Genes with ≥1 protein at FDR < %.2f (per-gene): %d\n",
+            FDR_THRESHOLD, sum(n_sig_per_gene >= 1)))
+# Genes with ≥1 protein at FDR < 0.10 (per-gene): 4585
+
+#saveRDS(gene_qval_per_gene, file.path(RESULTS_DIR, "gene_qval_per_gene.rds"))
+
+# ==============================================================================
+# SECTION 3: COMPUTE PER-PROTEIN FDR (Column-wise BH)
+# ==============================================================================
+
+# For each protein (column), apply BH correction across all genes
+gene_qval_per_protein <- apply(gene_pval_mat, 2, function(pvals) {
+  p.adjust(pvals, method = "BH")
+})
+
+# Preserve dimension names
+rownames(gene_qval_per_protein) <- rownames(gene_pval_mat)
+colnames(gene_qval_per_protein) <- colnames(gene_pval_mat)
+
+cat(sprintf("Per-protein FDR matrix: %d × %d\n", 
+            nrow(gene_qval_per_protein), ncol(gene_qval_per_protein)))
+# Per-protein FDR matrix: 17336 × 201
+
+# Count significant per protein
+n_sig_per_protein <- colSums(gene_qval_per_protein < FDR_THRESHOLD, na.rm = TRUE)
+cat(sprintf("Proteins with ≥1 gene at FDR < %.2f (per-protein): %d\n",
+            FDR_THRESHOLD, sum(n_sig_per_protein >= 1)))
+cat(sprintf("Total significant gene-protein pairs (per-protein FDR): %d\n",
+            sum(gene_qval_per_protein < FDR_THRESHOLD, na.rm = TRUE)))
+
+
+# Count genes with at least one significant proteins
+n_sig_genes_per_protein <- rowSums(gene_qval_per_protein < FDR_THRESHOLD, na.rm = TRUE)
+cat(sprintf("Genes with ≥1 protein at FDR < %.2f (per-protein): %d\n",
+            FDR_THRESHOLD, sum(n_sig_genes_per_protein >= 1)))
+# Genes with ≥1 protein at FDR < 0.10 (per-protein): 2848
+
+#saveRDS(gene_qval_per_protein, file.path(RESULTS_DIR, "gene_qval_per_protein.rds"))
+@
+
+<<>>=
+# ==============================================================================
+# SECTION 4: COMPARE FDR STRATEGIES
+# ==============================================================================
+gene_qval_mat <- readRDS(file.path(results_dir, "gene_qval_mat.rds"))
+
+# Count significant hits under each strategy
+n_sig_global <- sum(gene_qval_mat < FDR_THRESHOLD, na.rm = TRUE)
+n_sig_per_gene_total <- sum(gene_qval_per_gene < FDR_THRESHOLD, na.rm = TRUE)
+n_sig_per_protein_total <- sum(gene_qval_per_protein < FDR_THRESHOLD, na.rm = TRUE)
+
+cat("--- Significant gene-protein pairs at FDR < 0.10 ---\n")
+cat(sprintf("Global FDR:      %6d pairs\n", n_sig_global))
+cat(sprintf("Per-protein FDR: %6d pairs\n", n_sig_per_protein_total))
+cat(sprintf("Per-gene FDR:    %6d pairs (CAUTION: weak correction)\n", n_sig_per_gene_total))
+
+# Genes with at least one significant protein
+genes_sig_global <- rownames(gene_qval_mat)[rowSums(gene_qval_mat < FDR_THRESHOLD, na.rm = TRUE) >= 1]
+genes_sig_per_protein <- rownames(gene_qval_per_protein)[rowSums(gene_qval_per_protein < FDR_THRESHOLD, na.rm = TRUE) >= 1]
+genes_sig_per_gene <- rownames(gene_qval_per_gene)[rowSums(gene_qval_per_gene < FDR_THRESHOLD, na.rm = TRUE) >= 1]
+
+cat("\n--- Genes with ≥1 protein at FDR < 0.10 ---\n")
+cat(sprintf("Global FDR:      %5d genes\n", length(genes_sig_global)))
+# Global FDR:       1428 genes
+cat(sprintf("Per-protein FDR: %5d genes\n", length(genes_sig_per_protein)))
+# Per-protein FDR:  2848 genes
+cat(sprintf("Per-gene FDR:    %5d genes (CAUTION: weak correction)\n", length(genes_sig_per_gene)))
+# Per-gene FDR:     4585 genes (CAUTION: weak correction)
+
+# Overlap analysis
+cat("\n--- Overlap Analysis ---\n")
+cat(sprintf("Global ∩ Per-protein: %d genes\n", 
+            length(intersect(genes_sig_global, genes_sig_per_protein))))
+cat(sprintf("Global ∩ Per-gene: %d genes\n", 
+            length(intersect(genes_sig_global, genes_sig_per_gene))))
+cat(sprintf("Per-protein ∩ Per-gene: %d genes\n", 
+            length(intersect(genes_sig_per_protein, genes_sig_per_gene))))
+
+# Summary table
+comparison_summary <- data.frame(
+  FDR_Strategy = c("Global", "Per-protein", "Per-gene"),
+  Total_Pairs_Significant = c(n_sig_global, n_sig_per_protein_total, n_sig_per_gene_total),
+  Genes_With_Any_Hit = c(length(genes_sig_global), length(genes_sig_per_protein), length(genes_sig_per_gene)),
+  Tests_Per_Correction = c(
+    nrow(gene_pval_mat) * ncol(gene_pval_mat),  # ~3.5M
+    nrow(gene_pval_mat),                         # 17,336
+    ncol(gene_pval_mat)                          # 201
+  ),
+  Note = c(
+    "Most conservative",
+    "Recommended: biologically interpretable",
+    "CAUTION: Very weak correction (only 201 tests)"
+  )
+)
+
+print(comparison_summary)
+
+# write.csv(comparison_summary, file.path(OUTPUT_DIR, "fdr_comparison_summary.csv"), row.names = FALSE)
+
+# ==============================================================================
+# SECTION 5: DISTRIBUTION OF PER-GENE vs PER-PROTEIN FDR
+# ==============================================================================
+
+# Sample for visualization (full matrices are too large)
+set.seed(42)
+sample_idx <- sample(1:length(gene_qval_mat), min(100000, length(gene_qval_mat)))
+
+fdr_comparison_df <- data.frame(
+  global_fdr = as.vector(gene_qval_mat)[sample_idx],
+  per_protein_fdr = as.vector(gene_qval_per_protein)[sample_idx],
+  per_gene_fdr = as.vector(gene_qval_per_gene)[sample_idx]
+)
+
+# Scatter: Global vs Per-protein
+p_global_vs_perprotein <- ggplot(fdr_comparison_df, aes(x = global_fdr, y = per_protein_fdr)) +
+  geom_point(alpha = 0.1, size = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.10, linetype = "dotted", color = "blue") +
+  geom_vline(xintercept = 0.10, linetype = "dotted", color = "blue") +
+  labs(
+    title = "Global FDR vs Per-Protein FDR",
+    subtitle = "Per-protein is less conservative (more discoveries)",
+    x = "Global FDR (BH across 3.5M tests)",
+    y = "Per-Protein FDR (BH across 17K genes)"
+  ) +
+  coord_fixed() +
+  xlim(0, 1) + ylim(0, 1) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+p_global_vs_perprotein
+# ggsave(file.path(OUTPUT_DIR, "fdr_scatter_global_vs_perprotein.pdf"), 
+#        p_global_vs_perprotein, width = 7, height = 7)
+
+# Scatter: Global vs Per-gene
+p_global_vs_pergene <- ggplot(fdr_comparison_df, aes(x = global_fdr, y = per_gene_fdr)) +
+  geom_point(alpha = 0.1, size = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = 0.10, linetype = "dotted", color = "blue") +
+  geom_vline(xintercept = 0.10, linetype = "dotted", color = "blue") +
+  labs(
+    title = "Global FDR vs Per-Gene FDR",
+    subtitle = "Per-gene has very weak correction (only 201 tests) - NOT RECOMMENDED",
+    x = "Global FDR (BH across 3.5M tests)",
+    y = "Per-Gene FDR (BH across 201 proteins)"
+  ) +
+  coord_fixed() +
+  xlim(0, 1) + ylim(0, 1) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+p_global_vs_pergene
+@
+
+\end{document}

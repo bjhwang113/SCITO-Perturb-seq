@@ -1,0 +1,1092 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+\title{sgRNA-Level LFC, SE, and Z-Score Analysis}
+\maketitle
+
+\section{Overview}
+
+This analysis calculates LFC (log fold change), SE (standard error), and Z-scores 
+using batch-regressed and normalized data. This is the \textbf{secondary analysis} 
+(sgRNA-level) for robustness validation, consistent with Zhu et al. 2025 methodology.
+
+\textbf{Method:}
+\begin{enumerate}
+  \item For each sgRNA: compute mean and variance across all cells with that sgRNA
+  \item Compute mean and variance across all NTC cells (global baseline)
+  \item LFC = sgRNA mean - NTC mean
+  \item SE = sqrt(var\_sgRNA/n\_sgRNA + var\_NTC/n\_NTC)
+  \item Z-score = LFC / SE
+  \item P-values from Welch's t-test (two-sided)
+\end{enumerate}
+
+The Good News - Self-Targeted Validation is Strong
+Metric                      Value   Interpretation
+Self-targeted \% positive   79.6\%    CRISPRa works - activation → protein increase
+Self-targeted concordance   75.4\%    When there's real signal, sgRNAs agree
+Self-targeted ρ (LFC)       0.556     Strong correlation for true effects
+
+<<load-packages>>=
+# SETUP: Load Packages
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(stringr)
+})
+
+set.seed(42)
+@
+
+\section{Load Data}
+
+<<>>=
+# library(sceasy)
+# sceasy::convertFormat(
+#   '/mnt/my-data/scitoseq/deviance_norm.h5ad',
+#   from="anndata", to="seurat",
+#   outFile='/home/ec2-user/scitoseq/data/deviance_norm.rds')
+@
+
+Warning: Feature names cannot have underscores ('_'), replacing with dashes ('-')
+X -> counts
+An object of class Seurat 
+203 features across 3134864 samples within 1 assay 
+Active assay: RNA (203 features, 0 variable features)
+ 2 layers present: counts, data
+ 2 dimensional reductions calculated: pca, umap
+
+<<load-data>>=
+# SECTION 1: Load Batch-Regressed Data
+
+# Load the deviance-normalized (batch-regressed) data
+RAW_RDS <- "/home/ec2-user/scitoseq/data/deviance_norm.rds"
+raw_data <- readRDS(RAW_RDS)
+
+# Clean protein names
+old_names <- rownames(raw_data)
+prefix_pat <- "^(anti-human-mouse-rat-|anti-mouse-human-|anti-human-mouse-|anti-human-|anti-mouse-|Mouse-|Rat-|ArmenianHamsterIgG-)"
+clean_names <- gsub(prefix_pat, "", old_names)
+clean_names <- gsub("-barcode\\d+$", "", clean_names)
+
+# Extract counts and metadata
+counts <- raw_data@assays$RNA@counts
+rownames(counts) <- clean_names
+meta <- raw_data@meta.data
+
+cat(sprintf("Data dimensions: %d proteins × %d cells\n", nrow(counts), ncol(counts)))
+
+rm(raw_data); gc()
+
+# Create clean guide columns
+meta$guide_target_clean <- ifelse(
+  grepl("NO-TARGET", meta$guide_target, ignore.case = TRUE),
+  "NTC", as.character(meta$guide_target))
+meta$guide_target_clean <- factor(meta$guide_target_clean)
+
+meta$guide_assignment_clean <- ifelse(
+  meta$guide_target_clean == "NTC", 
+  "NTC", 
+  as.character(meta$guide_assignment))
+
+# Summary
+gene_targets <- setdiff(unique(as.character(meta$guide_target_clean)), "NTC")
+all_sgrnas <- setdiff(unique(meta$guide_assignment_clean), "NTC")
+
+cat(sprintf("Perturbation targets (genes): %d\n", length(gene_targets)))
+cat(sprintf("sgRNAs (excluding NTC): %d\n", length(all_sgrnas)))
+cat(sprintf("NTC cells: %d\n", sum(meta$guide_target_clean == "NTC")))
+cat(sprintf("Perturbation cells: %d\n", sum(meta$guide_target_clean != "NTC")))
+
+## ---------- Remove IgE / IgLightChainL ----------
+drop_feats <- c("IgE", "IgLightChainL")
+keep_rows  <- !(rownames(counts) %in% drop_feats)
+counts <- counts[keep_rows, , drop = FALSE]
+
+# Protein list
+all_proteins <- rownames(counts)
+n_proteins <- length(all_proteins)
+cat(sprintf("Proteins: %d\n", n_proteins))
+@
+
+Data dimensions: 203 proteins × 3134864 cells
+Perturbation targets (genes): 17755
+sgRNAs (excluding NTC): 28104
+NTC cells: 26602
+Perturbation cells: 3108262
+Proteins: 201
+
+\section{Calculate NTC Statistics}
+
+<<ntc-stats>>=
+# SECTION 2: Calculate NTC Baseline Statistics
+
+# Get NTC cell indices
+ntc_idx <- which(meta$guide_assignment_clean == "NTC")
+n_ntc <- length(ntc_idx)
+cat(sprintf("NTC cells: %d\n", n_ntc))
+
+# NTC counts matrix (proteins × NTC cells)
+counts_ntc <- counts[, ntc_idx, drop = FALSE]
+
+# NTC means (per protein)
+ntc_means <- Matrix::rowMeans(counts_ntc)
+
+# NTC variances (per protein)
+# var(x) = E[x²] - E[x]²
+ntc_sq_means <- Matrix::rowMeans(counts_ntc^2)
+ntc_vars <- ntc_sq_means - ntc_means^2
+
+# Apply Bessel's correction for sample variance: var * n/(n-1)
+ntc_vars <- ntc_vars * n_ntc / (n_ntc - 1)
+
+cat(sprintf("NTC mean range: [%.4f, %.4f]\n", min(ntc_means), max(ntc_means)))
+cat(sprintf("NTC variance range: [%.4f, %.4f]\n", min(ntc_vars), max(ntc_vars)))
+
+# Clean up
+rm(counts_ntc); gc()
+@
+
+NTC mean range: [-0.0469, 0.0241]
+NTC variance range: [0.8024, 1.4071]
+
+\section{Calculate sgRNA Statistics (Vectorized)}
+
+<<sgrna-stats>>=
+# SECTION 3: Calculate sgRNA Statistics Using Vectorized Sparse Operations
+
+# Get non-NTC cells
+non_ntc_idx <- which(meta$guide_assignment_clean != "NTC")
+sgrna_assignments <- meta$guide_assignment_clean[non_ntc_idx]
+counts_non_ntc <- counts[, non_ntc_idx, drop = FALSE]
+
+# Unique sgRNAs
+unique_sgrnas <- sort(unique(sgrna_assignments))
+n_sgrnas <- length(unique_sgrnas)
+
+cat(sprintf("Computing statistics for %d sgRNAs across %d proteins...\n", 
+            n_sgrnas, n_proteins))
+# Computing statistics for 28104 sgRNAs across 201 proteins...
+t_start <- Sys.time()
+
+# VECTORIZED APPROACH: Use sparse matrix multiplication
+# Build indicator matrix: rows = cells, cols = sgRNAs
+
+cat("Building sgRNA indicator matrix...\n")
+
+sgrna_factor <- factor(sgrna_assignments, levels = unique_sgrnas)
+
+indicator_mat <- Matrix::sparseMatrix(
+  i = seq_along(sgrna_assignments),
+  j = as.integer(sgrna_factor),
+  x = 1,
+  dims = c(length(sgrna_assignments), n_sgrnas),
+  dimnames = list(NULL, unique_sgrnas)
+)
+
+cat(sprintf("Indicator matrix: %d cells × %d sgRNAs\n", 
+            nrow(indicator_mat), ncol(indicator_mat)))
+
+# Cell counts per sgRNA
+ncells_per_sgrna <- Matrix::colSums(indicator_mat)
+names(ncells_per_sgrna) <- unique_sgrnas
+
+cat(sprintf("Cell counts range: %d - %d (median: %.0f)\n",
+            min(ncells_per_sgrna), max(ncells_per_sgrna), median(ncells_per_sgrna)))
+
+# STEP 1: Compute sums via sparse matrix multiplication
+# Result: (proteins × sgRNAs)
+cat("Computing expression sums...\n")
+sgrna_sums <- counts_non_ntc %*% indicator_mat
+sgrna_sums_dense <- as.matrix(sgrna_sums)
+
+# STEP 2: Compute sum of squares
+# Square the counts element-wise, then multiply by indicator
+cat("Computing sum of squares...\n")
+counts_sq <- counts_non_ntc^2
+sgrna_sumsq <- counts_sq %*% indicator_mat
+sgrna_sumsq_dense <- as.matrix(sgrna_sumsq)
+
+rm(counts_sq, sgrna_sums, sgrna_sumsq); gc()
+
+# STEP 3: Compute means
+# sgrna_means is (proteins × sgRNAs)
+cat("Computing means...\n")
+sgrna_means <- sweep(sgrna_sums_dense, 2, ncells_per_sgrna, "/")
+
+# STEP 4: Compute variances using: var = E[x²] - E[x]²
+# Then apply Bessel's correction: var * n/(n-1)
+cat("Computing variances...\n")
+sgrna_sq_means <- sweep(sgrna_sumsq_dense, 2, ncells_per_sgrna, "/")
+sgrna_vars_uncorrected <- sgrna_sq_means - sgrna_means^2
+
+# Apply Bessel's correction for sample variance
+# For cells with n=1, variance is undefined (set to NA or large value)
+bessel_factor <- ncells_per_sgrna / (ncells_per_sgrna - 1)
+bessel_factor[ncells_per_sgrna <= 1] <- NA  # Handle n=1 case
+
+sgrna_vars <- sweep(sgrna_vars_uncorrected, 2, bessel_factor, "*")
+
+# Handle negative variances due to numerical precision (set to small positive)
+sgrna_vars[sgrna_vars < 0 & !is.na(sgrna_vars)] <- 1e-10
+
+# Clean up
+rm(sgrna_sums_dense, sgrna_sumsq_dense, sgrna_sq_means, sgrna_vars_uncorrected); gc()
+
+elapsed <- difftime(Sys.time(), t_start, units = "secs")
+cat(sprintf("Statistics computation completed in %.1f seconds\n", elapsed))
+@
+
+Computing statistics for 28104 sgRNAs across 201 proteins...
+Indicator matrix: 3108262 cells × 28104 sgRNAs
+Cell counts range: 1 - 1237 (median: 88)
+Statistics computation completed in 17.0 seconds
+
+\section{Calculate LFC, SE, Z-score, and P-values}
+
+<<calculate-lfc-se-zscore>>=
+# SECTION 4: Calculate LFC, SE, Z-score, and P-values
+
+# LFC = sgRNA mean - NTC mean
+# Transpose to get (sgRNAs × proteins) format
+cat("Computing LFC...\n")
+lfc_mat <- t(sgrna_means) - matrix(ntc_means, nrow = n_sgrnas, ncol = n_proteins, byrow = TRUE)
+rownames(lfc_mat) <- unique_sgrnas
+colnames(lfc_mat) <- all_proteins
+
+# SE = sqrt(var_sgRNA/n_sgRNA + var_NTC/n_NTC)
+cat("Computing SE...\n")
+
+# NTC variance contribution (constant for all sgRNAs)
+# var_NTC / n_NTC for each protein
+ntc_var_contrib <- ntc_vars / n_ntc
+
+# sgRNA variance contribution: var_sgRNA / n_sgRNA
+# sgrna_vars is (proteins × sgRNAs), need to divide each column by its n
+sgrna_var_contrib <- sweep(sgrna_vars, 2, ncells_per_sgrna, "/")
+
+# SE² = var_sgRNA/n_sgRNA + var_NTC/n_NTC
+# Add NTC contribution (same for all sgRNAs) to each column
+se_squared <- sgrna_var_contrib + matrix(ntc_var_contrib, 
+                                          nrow = n_proteins, 
+                                          ncol = n_sgrnas, 
+                                          byrow = FALSE)
+
+# SE matrix (transpose to sgRNAs × proteins)
+se_mat <- t(sqrt(se_squared))
+rownames(se_mat) <- unique_sgrnas
+colnames(se_mat) <- all_proteins
+
+# Z-score = LFC / SE
+cat("Computing Z-scores...\n")
+zscore_mat <- lfc_mat / se_mat
+
+# P-values from Welch's t-test
+# Two-sided: p = 2 * pt(-|Z|, df)
+# Welch-Satterthwaite degrees of freedom approximation
+cat("Computing p-values (Welch's t-test)...\n")
+
+# Welch-Satterthwaite df formula:
+# df = (var1/n1 + var2/n2)² / [(var1/n1)²/(n1-1) + (var2/n2)²/(n2-1)]
+
+# For vectorized computation:
+# s1² = var_sgRNA, n1 = n_sgRNA
+# s2² = var_NTC, n2 = n_NTC
+
+# Numerator: (s1²/n1 + s2²/n2)² = SE⁴
+numerator_df <- se_squared^2
+
+# Denominator terms
+# Term 1: (s1²/n1)² / (n1-1) = (var_sgRNA/n_sgRNA)² / (n_sgRNA-1)
+term1 <- sweep(sgrna_var_contrib^2, 2, ncells_per_sgrna - 1, "/")
+
+# Term 2: (s2²/n2)² / (n2-1) = (var_NTC/n_NTC)² / (n_NTC-1)
+term2 <- (ntc_var_contrib^2) / (n_ntc - 1)
+
+# Denominator
+denominator_df <- term1 + matrix(term2, nrow = n_proteins, ncol = n_sgrnas, byrow = FALSE)
+
+# Degrees of freedom (proteins × sgRNAs)
+df_mat <- numerator_df / denominator_df
+
+# Ensure df is at least 1
+df_mat[df_mat < 1 | is.na(df_mat)] <- 1
+
+# Transpose to (sgRNAs × proteins)
+df_mat <- t(df_mat)
+
+# P-values: two-sided t-test
+pval_mat <- 2 * pt(-abs(zscore_mat), df = df_mat)
+
+# Clean up
+rm(se_squared, sgrna_var_contrib, numerator_df, term1, denominator_df); gc()
+
+cat("Calculations complete.\n")
+@
+
+\section{Summary Statistics}
+
+<<summary-stats>>=
+# SECTION 5: Summary Statistics
+
+# --- LFC Summary ---
+cat("--- LFC Summary ---\n")
+lfc_vals <- as.vector(lfc_mat[!is.na(lfc_mat)])
+cat(sprintf("Total (sgRNA, protein) pairs: %d\n", length(lfc_vals)))
+cat(sprintf("Mean LFC: %.4f\n", mean(lfc_vals)))
+cat(sprintf("Median LFC: %.4f\n", median(lfc_vals)))
+cat(sprintf("SD LFC: %.4f\n", sd(lfc_vals)))
+cat(sprintf("Min: %.3f, Max: %.3f\n", min(lfc_vals), max(lfc_vals)))
+cat(sprintf("%% |LFC| > 0.05: %.1f%%\n", 100 * mean(abs(lfc_vals) > 0.05)))
+cat(sprintf("%% |LFC| > 0.10: %.1f%%\n", 100 * mean(abs(lfc_vals) > 0.10)))
+cat(sprintf("%% |LFC| > 0.20: %.1f%%\n", 100 * mean(abs(lfc_vals) > 0.20)))
+
+# --- SE Summary ---
+cat("\n--- SE Summary ---\n")
+se_vals <- as.vector(se_mat[!is.na(se_mat)])
+cat(sprintf("Mean SE: %.4f\n", mean(se_vals)))
+cat(sprintf("Median SE: %.4f\n", median(se_vals)))
+cat(sprintf("SD SE: %.4f\n", sd(se_vals)))
+cat(sprintf("Min: %.4f, Max: %.4f\n", min(se_vals), max(se_vals)))
+
+# --- Z-score Summary ---
+cat("\n--- Z-score Summary ---\n")
+z_vals <- as.vector(zscore_mat[!is.na(zscore_mat) & is.finite(zscore_mat)])
+cat(sprintf("Mean Z: %.4f\n", mean(z_vals)))
+cat(sprintf("Median Z: %.4f\n", median(z_vals)))
+cat(sprintf("SD Z: %.4f\n", sd(z_vals)))
+cat(sprintf("Min: %.3f, Max: %.3f\n", min(z_vals), max(z_vals)))
+cat(sprintf("%% |Z| > 1.96: %.2f%%\n", 100 * mean(abs(z_vals) > 1.96)))
+cat(sprintf("%% |Z| > 2.58: %.2f%%\n", 100 * mean(abs(z_vals) > 2.58)))
+cat(sprintf("%% |Z| > 3.0: %.2f%%\n", 100 * mean(abs(z_vals) > 3.0)))
+
+# --- P-value Summary ---
+cat("\n--- P-value Summary ---\n")
+p_vals <- as.vector(pval_mat[!is.na(pval_mat)])
+cat(sprintf("%% p < 0.05: %.2f%%\n", 100 * mean(p_vals < 0.05)))
+cat(sprintf("%% p < 0.01: %.2f%%\n", 100 * mean(p_vals < 0.01)))
+cat(sprintf("%% p < 0.001: %.2f%%\n", 100 * mean(p_vals < 0.001)))
+
+# --- FDR Correction ---
+cat("\n--- FDR Correction (Benjamini-Hochberg) ---\n")
+qval_vec <- p.adjust(p_vals, method = "BH")
+cat(sprintf("%% FDR < 0.05: %.3f%%\n", 100 * mean(qval_vec < 0.05)))
+cat(sprintf("%% FDR < 0.10: %.3f%%\n", 100 * mean(qval_vec < 0.10)))
+cat(sprintf("%% FDR < 0.20: %.3f%%\n", 100 * mean(qval_vec < 0.20)))
+
+# # Create FDR matrix
+# qval_mat <- matrix(qval_vec, nrow = nrow(pval_mat), ncol = ncol(pval_mat))
+
+# Create FDR matrix preserving NA structure
+qval_mat <- pval_mat  # Copy structure including NAs
+non_na_idx <- !is.na(pval_mat)
+qval_mat[non_na_idx] <- p.adjust(pval_mat[non_na_idx], method = "BH")
+rownames(qval_mat) <- rownames(pval_mat)
+colnames(qval_mat) <- colnames(pval_mat)
+dim(qval_mat) # 28104   201
+@
+
+--- LFC Summary ---
+Total (sgRNA, protein) pairs: 5648904
+Mean LFC: 0.0095
+Median LFC: 0.0045
+SD LFC: 0.1493
+Min: -1.862, Max: 13.614
+\% |LFC| > 0.05: 64.4%
+\% |LFC| > 0.10: 37.8%
+\% |LFC| > 0.20: 12.1%
+
+--- SE Summary ---
+Mean SE: 0.1199
+Median SE: 0.1033
+SD SE: 0.0739
+Min: 0.0060, Max: 13.4730
+
+--- Z-score Summary ---
+Mean Z: 0.0034
+Median Z: 0.0452
+SD Z: 1.2507
+Min: -245.833, Max: 325.836
+
+\% |Z| > 1.96: 7.30%
+\% |Z| > 2.58: 2.22%
+\% |Z| > 3.0: 1.01%
+
+--- P-value Summary ---
+\% p < 0.05: 6.66%
+\% p < 0.01: 1.79%
+\% p < 0.001: 0.37%
+
+--- FDR Correction (Benjamini-Hochberg) ---
+\% FDR < 0.05: 0.072%
+\% FDR < 0.10: 0.117%
+\% FDR < 0.20: 0.238%
+
+\section{Build sgRNA Metadata}
+
+<<sgrna-metadata>>=
+# SECTION 6: Build sgRNA Metadata
+
+# Create sgRNA info dataframe
+sgrna_info <- meta %>% filter(guide_assignment_clean != "NTC") %>%
+  distinct(guide_assignment_clean, guide_target_clean, Batch) %>% rename(
+    sgRNA = guide_assignment_clean, gene = guide_target_clean,
+    batch = Batch) %>% mutate(
+    gene = as.character(gene), sgRNA = as.character(sgRNA),
+    batch = as.character(batch))
+
+# Add cell counts
+sgrna_info$n_cells <- ncells_per_sgrna[sgrna_info$sgRNA]
+
+cat(sprintf("sgRNA info rows: %d\n", nrow(sgrna_info)))
+cat(sprintf("Unique genes: %d\n", length(unique(sgrna_info$gene))))
+
+# Check sgRNAs per gene
+sgrnas_per_gene <- sgrna_info %>% group_by(gene) %>%
+  summarise(n_sgrnas = n(), .groups = "drop")
+
+cat("\nsgRNAs per gene distribution:\n")
+print(table(sgrnas_per_gene$n_sgrnas))
+
+# Genes with exactly 2 sgRNAs
+genes_with_2_sgrnas <- sgrnas_per_gene %>% filter(n_sgrnas == 2) %>% pull(gene)
+
+cat(sprintf("\nGenes with exactly 2 sgRNAs: %d\n", length(genes_with_2_sgrnas)))
+@
+
+sgRNA info rows: 28104
+Unique genes: 17755
+sgRNAs per gene distribution:
+    1     2 
+ 7406 10349 
+Genes with exactly 2 sgRNAs: 10349
+
+\section{sgRNA Concordance Analysis}
+
+<<concordance-analysis>>=
+# SECTION 7: sgRNA Concordance Analysis
+
+# Build paired comparison data for genes with 2 sgRNAs
+cat("Building paired sgRNA comparisons...\n")
+
+paired_data <- list()
+
+for (gene in genes_with_2_sgrnas) {
+  gene_sgrnas <- sgrna_info %>% filter(gene == !!gene) %>% arrange(sgRNA) %>%
+    pull(sgRNA)
+  
+  if (length(gene_sgrnas) != 2) next
+  
+  sg1 <- gene_sgrnas[1]
+  sg2 <- gene_sgrnas[2]
+  
+  if (!(sg1 %in% rownames(lfc_mat)) || !(sg2 %in% rownames(lfc_mat))) next
+  
+  lfc1 <- lfc_mat[sg1, ]
+  lfc2 <- lfc_mat[sg2, ]
+  se1 <- se_mat[sg1, ]
+  se2 <- se_mat[sg2, ]
+  z1 <- zscore_mat[sg1, ]
+  z2 <- zscore_mat[sg2, ]
+  
+  paired_data[[gene]] <- data.frame(
+    gene = gene, protein = all_proteins, sgRNA1 = sg1,
+    sgRNA2 = sg2, lfc1 = lfc1, lfc2 = lfc2, se1 = se1, se2 = se2,
+    z1 = z1, z2 = z2, stringsAsFactors = FALSE)
+}
+
+paired_df <- bind_rows(paired_data)
+cat(sprintf("Total paired comparisons: %d genes × %d proteins = %d pairs\n",
+            length(unique(paired_df$gene)), length(all_proteins), nrow(paired_df)))
+
+# Calculate concordance metrics
+paired_df <- paired_df %>% mutate(
+    concordant = sign(lfc1) == sign(lfc2),
+    diff = abs(lfc1 - lfc2),
+    mean_lfc = (lfc1 + lfc2) / 2,
+    max_abs_lfc = pmax(abs(lfc1), abs(lfc2)),
+    min_abs_lfc = pmin(abs(lfc1), abs(lfc2)),
+    concordant_z = sign(z1) == sign(z2))
+
+# Overall concordance
+n_concordant <- sum(paired_df$concordant, na.rm = TRUE)
+n_discordant <- sum(!paired_df$concordant, na.rm = TRUE)
+n_total <- n_concordant + n_discordant
+
+cat("\n--- Overall Concordance (LFC) ---\n")
+cat(sprintf("Concordant (same sign): %d (%.1f%%)\n", 
+            n_concordant, 100 * n_concordant / n_total))
+cat(sprintf("Discordant (opposite signs): %d (%.1f%%)\n", 
+            n_discordant, 100 * n_discordant / n_total))
+
+# Correlation between sgRNA pairs
+cor_pearson <- cor(paired_df$lfc1, paired_df$lfc2, method = "pearson", use = "complete.obs")
+cor_spearman <- cor(paired_df$lfc1, paired_df$lfc2, method = "spearman", use = "complete.obs")
+cor_z_pearson <- cor(paired_df$z1, paired_df$z2, method = "pearson", use = "complete.obs")
+
+cat(sprintf("\nCorrelation between sgRNA1 and sgRNA2:\n"))
+cat(sprintf("  LFC Pearson r: %.4f\n", cor_pearson))
+cat(sprintf("  LFC Spearman ρ: %.4f\n", cor_spearman))
+cat(sprintf("  Z-score Pearson r: %.4f\n", cor_z_pearson))
+
+# Concordance by effect size threshold
+cat("\n--- Concordance by Effect Size Threshold ---\n")
+thresholds <- c(0.05, 0.10, 0.15, 0.20, 0.30, 0.50)
+
+for (thresh in thresholds) {
+  subset <- paired_df %>%
+    filter(abs(lfc1) > thresh & abs(lfc2) > thresh)
+  
+  if (nrow(subset) > 0) {
+    conc_rate <- mean(subset$concordant, na.rm = TRUE)
+    cat(sprintf("Both |LFC| > %.2f: n=%d, concordance=%.1f%%\n",
+                thresh, nrow(subset), 100 * conc_rate))
+  }
+}
+
+# Concordance by Z-score threshold
+cat("\n--- Concordance by Z-score Threshold ---\n")
+z_thresholds <- c(1.0, 1.5, 1.96, 2.5, 3.0)
+
+for (thresh in z_thresholds) {
+  subset <- paired_df %>%
+    filter(abs(z1) > thresh & abs(z2) > thresh)
+  
+  if (nrow(subset) > 0) {
+    conc_rate <- mean(subset$concordant_z, na.rm = TRUE)
+    cat(sprintf("Both |Z| > %.2f: n=%d, concordance=%.1f%%\n",
+                thresh, nrow(subset), 100 * conc_rate))
+  }
+}
+@
+
+Total paired comparisons: 10349 genes × 201 proteins = 2080149 pairs
+
+--- Overall Concordance (LFC) ---
+Concordant (same sign): 1052264 (50.6%)
+Discordant (opposite signs): 1027885 (49.4%)
+
+Correlation between sgRNA1 and sgRNA2:
+LFC Pearson r: 0.0174
+LFC Spearman ρ: 0.0149
+ Z-score Pearson r: 0.0117
+ 
+--- Concordance by Effect Size Threshold ---
+Both |LFC| > 0.05: n=863743, concordance=51.1%
+Both |LFC| > 0.10: n=297450, concordance=51.9%
+Both |LFC| > 0.15: n=94740, concordance=53.1%
+Both |LFC| > 0.20: n=30739, concordance=54.5%
+Both |LFC| > 0.30: n=3873, concordance=58.3%
+Both |LFC| > 0.50: n=179, concordance=65.4%
+
+--- Concordance by Z-score Threshold ---
+Both |Z| > 1.00: n=255725, concordance=51.7%
+Both |Z| > 1.50: n=56827, concordance=52.5%
+Both |Z| > 1.96: n=11447, concordance=54.6%
+Both |Z| > 2.50: n=1503, concordance=57.1%
+Both |Z| > 3.00: n=275, concordance=66.9%
+
+\section{Self-Targeted Validation}
+
+Marker↔gene correspondence
+correspondence between self-targeted guides and protein markers
+<<>>=
+markers <- c(
+  "CD86","CD274","CD273","CD270","CD47","CD70","CD30","CD48","CD40","CD154",
+  "CD52","CD3","CD8","CD56","CD33","CD11c","CD34","CD269","HLA-ABC","CD90",
+  "CD117","CD10","CD45RA","CD123","CD7","CD105","CD49f","CD194","CD4","CD44",
+  "CD14","CD16","CD25","CD45RO","CD279","TIGIT","IgG1k-isotypeCtrl","IgG2ak-isotypeCtrl","IgG2bk-isotypeCtrl","IgG2bkIsotypeCtrl",
+  "CD335","CD294","CD45R-B220","CD31","EGFR","CD146","CD324","CD5","TCRrd","CD183",
+  "CD195","CD32","CD196","CD185","CD103","CD69","CD62L","CD197","CD161","CD152",
+  "CD223","KLRG1","CD27","CD107a","CD95","CD134","HLA-DR","CD11b","CD64","CD1d",
+  "CD314","CD35","CD57Recombinant","CD366","CD272","CD278","CD58","CD96","CD39","CD178",
+  "CX3CR1","CD24","CD21","CD11a","CD244","XCR1","Notch1","integrinB7","CD268","CD42b",
+  "CD54","CD119","TCRab","Notch3","IgG1k-isotypeCtrl1","IgG2ak-IsotypeCtrl","IsotypeCtrl","CD192","CD102","CD106",
+  "CD122","CD267","CD135","CD41","CD137","CD254","CD43","CD83","CD357","CD59",
+  "CD124","CD184","CD2","CD226","CD29","CD49b","CD81","CD98","CD55","CD18",
+  "CD28","TSLPR","CD38","CD127","CD45","CD71","B7-H4","CD26","CD193","CD115",
+  "CD144","CD63","CD36","CD243","CD72","CD158","MERTK","FolateReceptorB","TIM-4","CD171",
+  "anti-CD230-Prion","CD200","C5L2","CD49a","CD49d","CD73","CD9","TCR-Va7.2","TCR-Vd2","TCR-Vr9",
+  "TCR-Va24-Ja18","CD305","CD158b","CD158e1","CD158f","CD337","CD336","CD253","CD186","CD109",
+  "CD126","GP130","CD307c-FcRL3","CD319","CD138","CD199","CD45RB","CD99","CD46","CD151",
+  "CD218a","CD257","CD352","CLEC1B","CD94","CD365","CD150","CD162","CD84","MR1",
+  "Mac-2 ","CD85j","CD23","HLA-A2","CD198","GARP","TCR-Vb13.1","GPR56","CD158d","HLA-E",
+  "MICA-MICB","CD82","NKp80","CD131","CD74","CD317","CD37","CD101","CD321","CD360",
+  "CD166","HLA-DR-DP-DQ","CD120b","CD104","CD224","HLA-DQ","Notch2","LAP"
+)
+
+## --- Normalize obvious quirks (e.g., trailing spaces) ---
+markers <- trimws(markers)
+
+## --- Build mapping: marker -> gene symbol(s). Multi-gene entries are ';'-separated. ---
+map <- c(
+  "CD86"="CD86", "CD274"="CD274", "CD273"="PDCD1LG2", "CD270"="TNFRSF14",
+  "CD47"="CD47", "CD70"="CD70", "CD30"="TNFRSF8", "CD48"="CD48", "CD40"="CD40",
+  "CD154"="CD40LG", "CD52"="CD52", "CD3"="CD3D;CD3E;CD3G", "CD8"="CD8A;CD8B",
+  "CD56"="NCAM1", "CD33"="SIGLEC3", "CD11c"="ITGAX", "CD34"="CD34",
+  "CD269"="TNFRSF17", "HLA-ABC"="HLA-A;HLA-B;HLA-C", "CD90"="THY1",
+  "CD117"="KIT", "CD10"="MME", "CD45RA"="PTPRC", "CD123"="IL3RA", "CD7"="CD7",
+  "CD105"="ENG", "CD49f"="ITGA6", "CD194"="CCR4", "CD4"="CD4", "CD44"="CD44",
+  "CD14"="CD14", "CD16"="FCGR3A;FCGR3B", "CD25"="IL2RA", "CD45RO"="PTPRC",
+  "CD279"="PDCD1", "TIGIT"="TIGIT", "IgG1k-isotypeCtrl"=NA,
+  "IgG2ak-isotypeCtrl"=NA, "IgG2bk-isotypeCtrl"=NA, "IgG2bkIsotypeCtrl"=NA,
+  "CD335"="NCR1", "CD294"="PTGDR2", "CD45R-B220"="PTPRC", "CD31"="PECAM1",
+  "EGFR"="EGFR", "CD146"="MCAM", "CD324"="CDH1", "CD5"="CD5", 
+  "TCRrd"="TRDC;TRGC1;TRGC2", "CD183"="CXCR3", "CD195"="CCR5", 
+  "CD32"="FCGR2A;FCGR2B;FCGR2C", "CD196"="CCR6", "CD185"="CXCR5", "CD103"="ITGAE",
+  "CD69"="CD69", "CD62L"="SELL", "CD197"="CCR7", "CD161"="KLRB1",
+  "CD152"="CTLA4", "CD223"="LAG3", "KLRG1"="KLRG1", "CD27"="TNFRSF7",
+  "CD107a"="LAMP1", "CD95"="FAS",
+  "CD134"="TNFRSF4", "HLA-DR"="HLA-DRA;HLA-DRB1;HLA-DRB3;HLA-DRB4;HLA-DRB5",
+  "CD11b"="ITGAM", "CD64"="FCGR1A;FCGR1B;FCGR1C", "CD1d"="CD1D", "CD314"="KLRK1",
+  "CD35"="CR1", "CD57Recombinant"="B3GAT1", "CD366"="HAVCR2", "CD272"="BTLA",
+  "CD278"="ICOS", "CD58"="CD58", "CD96"="CD96", "CD39"="ENTPD1", "CD178"="FASLG",
+  "CX3CR1"="CX3CR1", "CD24"="CD24", "CD21"="CR2", "CD11a"="ITGAL", "CD244"="CD244",
+  "XCR1"="XCR1", "Notch1"="NOTCH1", "integrinB7"="ITGB7", "CD268"="TNFRSF13C",
+  "CD42b"="GP1BA", "CD54"="ICAM1", "CD119"="IFNGR1", "TCRab"="TRAC;TRBC1;TRBC2",
+  "Notch3"="NOTCH3", "IgG1k-isotypeCtrl1"=NA, "IgG2ak-IsotypeCtrl"=NA,
+  "IsotypeCtrl"=NA, "CD192"="CCR2", "CD102"="ICAM2", "CD106"="VCAM1", "CD122"="IL2RB",
+  "CD267"="TNFRSF13B", "CD135"="FLT3", "CD41"="ITGA2B", "CD137"="TNFRSF9", "CD254"="TNFSF11",
+  "CD43"="SPN", "CD83"="CD83", "CD357"="TNFRSF18", "CD59"="CD59", "CD124"="IL4R",
+  "CD184"="CXCR4", "CD2"="CD2", "CD226"="CD226", "CD29"="ITGB1", "CD49b"="ITGA2",
+  "CD81"="CD81", "CD98"="SLC3A2", "CD55"="CD55", "CD18"="ITGB2", "CD28"="CD28",
+  "TSLPR"="CRLF2", "CD38"="CD38", "CD127"="IL7R", "CD45"="PTPRC",
+  "CD71"="TFRC", "B7-H4"="VTCN1", "CD26"="DPP4", "CD193"="CCR3", "CD115"="CSF1R",
+  "CD144"="CDH5", "CD63"="CD63", "CD36"="CD36", "CD243"="ABCB1", "CD72"="CD72",
+  "CD158"="KIR2DL;KIR2DS;KIR3D",     # family-level (non-specific clone)
+  "MERTK"="MERTK", "FolateReceptorB"="FOLR2", "TIM-4"="TIMD4", "CD171"="L1CAM",
+  "anti-CD230-Prion"="PRNP", "CD200"="CD200", "C5L2"="C5AR2", "CD49a"="ITGA1", "CD49d"="ITGA4", 
+  "CD73"="NT5E", "CD9"="CD9", "TCR-Va7.2"="TRAV1-2", "TCR-Vd2"="TRDV2", "TCR-Vr9"="TRGV9",
+  "TCR-Va24-Ja18"="TRAV10;TRAJ18", "CD305"="LAIR1", "CD158b"="KIR2DL2;KIR2DL3;KIR2DS2",
+  "CD158e1"="KIR3DL1", "CD158f"="KIR2DS4", "CD337"="NCR3", "CD336"="NCR2", "CD253"="TNFSF10",
+  "CD186"="CXCR6", "CD109"="CD109", "CD126"="IL6R", "GP130"="IL6ST", "CD307c-FcRL3"="FCRL3",
+  "CD319"="SLAMF7", "CD138"="SDC1", "CD199"="CCR9", "CD45RB"="PTPRC", "CD99"="CD99", 
+  "CD46"="CD46", "CD151"="CD151", "CD218a"="IL18R1", "CD257"="TNFSF13", "CD352"="SLAMF6",
+  "CLEC1B"="CLEC1B", "CD94"="KLRD1", "CD365"="VSIR", "CD150"="SLAMF1", "CD162"="SELPLG",
+  "CD84"="SLAMF5", "MR1"="MR1", "Mac-2"="LGALS3", "CD85j"="LILRB1", "CD23"="FCER2",
+  "HLA-A2"="HLA-A", "CD198"="CCR8", "GARP"="LRRC32", "TCR-Vb13.1"="TRBV13-1",
+  "GPR56"="ADGRG1", "CD158d"="KIR2DL4", "HLA-E"="HLA-E", "MICA-MICB"="MICA;MICB",
+  "CD82"="CD82", "NKp80"="KLRF1", "CD131"="CSF2RB", "CD74"="CD74", "CD317"="BST2",
+  "CD37"="CD37", "CD101"="CD101", "CD321"="F11R", "CD360"="IL21R", "CD166"="ALCAM",
+  "HLA-DR-DP-DQ"="HLA-DRA;HLA-DRB1;HLA-DRB3;HLA-DRB4;HLA-DRB5;HLA-DPA1;HLA-DPB1;HLA-DQA1;HLA-DQB1",
+  "CD120b"="TNFRSF1B", "CD104"="ITGB4",
+  "CD224"="GGT1", "HLA-DQ"="HLA-DQA1;HLA-DQB1", "Notch2"="NOTCH2", "LAP"="TGFB1"
+)
+
+## --- Make sure “Mac-2 ” and similar map to clean keys ---
+names(map)[names(map) == "Mac-2"] <- "Mac-2"
+
+## --- Construct the output data frame in the same order as input markers ---
+gene <- unname(map[markers])
+# sanity check: flag any unmapped markers
+unmapped <- which(is.na(gene) & !grepl("isotype", markers, ignore.case = TRUE))
+if (length(unmapped)) {
+  warning("Unmapped markers (non-isotype): ", paste(markers[unmapped], collapse = ", "))
+}
+
+marker_gene_df <- data.frame(marker = markers, gene = gene, stringsAsFactors = FALSE)
+#saveRDS(marker_gene_df, file = "/home/ec2-user/scitoseq/data/marker_gene_df.rds")
+@
+
+<<self-targeted>>=
+# SECTION 8: Self-Targeted Validation
+
+# Load marker-gene mapping
+marker_gene_df <- readRDS("/home/ec2-user/scitoseq/data/marker_gene_df.rds")
+
+# Build gene-to-marker map
+marker_gene_tidy <- marker_gene_df %>%
+  mutate(gene_list = str_split(gene, pattern = ";")) %>%
+  mutate(gene_list = lapply(gene_list, function(v) {
+    v <- v[!is.na(v)]
+    v <- trimws(v)
+    v <- v[nzchar(v)]
+    unique(v)
+  }))
+
+gene_to_marker_map <- marker_gene_tidy %>%
+  select(marker, gene_list) %>%
+  unnest_longer(gene_list, values_to = "gene_single") %>%
+  filter(!is.na(gene_single), nzchar(gene_single)) %>%
+  distinct(gene_single, marker)
+
+cat(sprintf("Gene-to-marker mappings: %d\n", nrow(gene_to_marker_map)))
+
+# Find self-targeted pairs
+self_targeted <- data.frame()
+
+for (i in 1:nrow(sgrna_info)) {
+  sg <- sgrna_info$sgRNA[i]
+  gene <- sgrna_info$gene[i]
+  batch <- sgrna_info$batch[i]
+  n_cells <- sgrna_info$n_cells[i]
+  
+  if (!(sg %in% rownames(lfc_mat))) next
+  
+  target_proteins <- gene_to_marker_map %>%
+    filter(gene_single == gene) %>%
+    pull(marker)
+  
+  target_proteins <- intersect(target_proteins, colnames(lfc_mat))
+  
+  if (length(target_proteins) == 0) next
+  
+  for (prot in target_proteins) {
+    lfc <- lfc_mat[sg, prot]
+    se <- se_mat[sg, prot]
+    zscore <- zscore_mat[sg, prot]
+    pval <- pval_mat[sg, prot]
+    qval <- qval_mat[sg, prot]
+    
+    self_targeted <- rbind(self_targeted, data.frame(
+      sgRNA = sg, gene = gene, protein = prot,
+      batch = batch, n_cells = n_cells, lfc = lfc, se = se,
+      zscore = zscore, pval = pval, qval = qval,
+      stringsAsFactors = FALSE))
+  }
+}
+
+cat(sprintf("Self-targeted pairs found: %d\n", nrow(self_targeted)))
+cat(sprintf("  Unique genes: %d\n", length(unique(self_targeted$gene))))
+cat(sprintf("  Unique proteins: %d\n", length(unique(self_targeted$protein))))
+
+# Self-targeted validation metrics
+cat("\n--- Self-Targeted Validation Metrics ---\n")
+cat("For CRISPRa, ground truth = positive LFC expected\n\n")
+
+cat(sprintf("Mean LFC: %.4f\n", mean(self_targeted$lfc, na.rm = TRUE)))
+cat(sprintf("Median LFC: %.4f\n", median(self_targeted$lfc, na.rm = TRUE)))
+cat(sprintf("%% Positive: %.1f%%\n", 100 * mean(self_targeted$lfc > 0, na.rm = TRUE)))
+cat(sprintf("%% LFC > 0.10: %.1f%%\n", 100 * mean(self_targeted$lfc > 0.10, na.rm = TRUE)))
+cat(sprintf("%% LFC > 0.50: %.1f%%\n", 100 * mean(self_targeted$lfc > 0.50, na.rm = TRUE)))
+
+cat(sprintf("\nMean Z-score: %.4f\n", mean(self_targeted$zscore, na.rm = TRUE)))
+cat(sprintf("Median Z-score: %.4f\n", median(self_targeted$zscore, na.rm = TRUE)))
+cat(sprintf("%% Z > 1.96: %.1f%%\n", 100 * mean(self_targeted$zscore > 1.96, na.rm = TRUE)))
+cat(sprintf("%% p < 0.05: %.1f%%\n", 100 * mean(self_targeted$pval < 0.05, na.rm = TRUE)))
+cat(sprintf("%% FDR < 0.10: %.1f%%\n", 100 * mean(self_targeted$qval < 0.10, na.rm = TRUE)))
+@
+
+Gene-to-marker mappings: 234
+Self-targeted pairs found: 319
+Unique genes: 187
+Unique proteins: 179
+--- Self-Targeted Validation Metrics ---
+For CRISPRa, ground truth = positive LFC expected
+Mean LFC: 0.7873
+Median LFC: 0.2156
+\% Positive: 79.6%
+\% LFC > 0.10: 65.2%
+\% LFC > 0.50: 35.4%
+Mean Z-score: 1.6909
+Median Z-score: 1.4238
+\% Z > 1.96: 42.6%
+\% p < 0.05: 42.0%
+\% FDR < 0.10: 13.2%
+
+\section{Self-Targeted Concordance}
+
+<<self-targeted-concordance>>=
+# SECTION 9: Self-Targeted sgRNA Concordance
+
+# Extract self-targeted concordance
+self_targeted_paired <- paired_df %>% inner_join(
+    gene_to_marker_map %>% 
+      rename(gene = gene_single, protein = marker),
+    by = c("gene", "protein"))
+
+cat(sprintf("Self-targeted paired comparisons: %d\n", nrow(self_targeted_paired)))
+
+if (nrow(self_targeted_paired) > 0) {
+  n_conc_self <- sum(self_targeted_paired$concordant, na.rm = TRUE)
+  n_disc_self <- sum(!self_targeted_paired$concordant, na.rm = TRUE)
+  
+  cat(sprintf("\n--- Self-Targeted Concordance ---\n"))
+  cat(sprintf("Concordant: %d (%.1f%%)\n", 
+              n_conc_self, 100 * n_conc_self / (n_conc_self + n_disc_self)))
+  cat(sprintf("Discordant: %d (%.1f%%)\n", 
+              n_disc_self, 100 * n_disc_self / (n_conc_self + n_disc_self)))
+  
+  # Correlation for self-targeted
+  cor_self_lfc <- cor(self_targeted_paired$lfc1, self_targeted_paired$lfc2, 
+                      method = "spearman", use = "complete.obs")
+  cor_self_z <- cor(self_targeted_paired$z1, self_targeted_paired$z2, 
+                    method = "spearman", use = "complete.obs")
+  cat(sprintf("Spearman ρ (LFC): %.4f\n", cor_self_lfc))
+  cat(sprintf("Spearman ρ (Z-score): %.4f\n", cor_self_z))
+  
+  # Both positive
+  both_positive <- self_targeted_paired %>%
+    filter(lfc1 > 0 & lfc2 > 0)
+  
+  cat(sprintf("\nBoth sgRNAs positive (CRISPRa validation): %d / %d (%.1f%%)\n",
+              nrow(both_positive), nrow(self_targeted_paired),
+              100 * nrow(both_positive) / nrow(self_targeted_paired)))
+}
+@
+
+Self-targeted paired comparisons: 122
+--- Self-Targeted Concordance ---
+Concordant: 92 (75.4%)
+Discordant: 30 (24.6%)
+Spearman ρ (LFC): 0.5565
+Spearman ρ (Z-score): 0.4400
+
+Both sgRNAs positive (CRISPRa validation): 84 / 122 (68.9%)
+Both sgRNAs positive (CRISPRa validation): 84 / 122 (68.9%)
+
+\section{Reliability Analysis}
+
+<<reliability>>=
+# SECTION 10: Reliability / Correlation Ceiling Analysis
+
+# Calculate reliability per protein
+# reliability = sigma²_true / (sigma²_true + sigma²_error)
+# sigma²_error = mean(SE²)
+# sigma²_total = var(LFC)
+# sigma²_true = sigma²_total - sigma²_error
+
+reliability_per_protein <- sapply(all_proteins, function(prot) {
+  lfc <- lfc_mat[, prot]
+  se <- se_mat[, prot]
+  
+  # Remove NAs and invalid values
+  valid <- !is.na(lfc) & !is.na(se) & se > 0 & is.finite(lfc) & is.finite(se)
+  lfc <- lfc[valid]
+  se <- se[valid]
+  
+  if (length(lfc) < 10) return(NA)
+  
+  # Variance components
+  sigma2_total <- var(lfc)                    # Total observed variance
+  sigma2_error <- mean(se^2)                  # Average measurement variance
+  sigma2_true <- max(0, sigma2_total - sigma2_error)  # True signal variance
+  
+  # Reliability
+  reliability <- sigma2_true / (sigma2_true + sigma2_error)
+  return(reliability)
+})
+
+cat("--- Reliability Summary (Correlation Ceiling) ---\n")
+cat(sprintf("Mean reliability: %.3f\n", mean(reliability_per_protein, na.rm = TRUE)))
+cat(sprintf("Median reliability: %.3f\n", median(reliability_per_protein, na.rm = TRUE)))
+cat(sprintf("Min reliability: %.3f\n", min(reliability_per_protein, na.rm = TRUE)))
+cat(sprintf("Max reliability: %.3f\n", max(reliability_per_protein, na.rm = TRUE)))
+
+# Theoretical maximum concordance
+mean_rel <- mean(reliability_per_protein, na.rm = TRUE)
+cat(sprintf("\nTheoretical max sgRNA correlation: ~%.3f\n", mean_rel))
+cat(sprintf("Observed sgRNA correlation (Spearman): %.3f\n", cor_spearman))
+if (mean_rel > 0) {
+  cat(sprintf("Observed / Theoretical: %.1f%%\n", 100 * cor_spearman / mean_rel))
+}
+@
+
+--- Reliability Summary (Correlation Ceiling) ---
+Mean reliability: 0.084
+Median reliability: 0.069
+Min reliability: 0.000
+Max reliability: 0.477
+Theoretical max sgRNA correlation: ~0.084
+Observed sgRNA correlation (Spearman): 0.015
+Observed / Theoretical: 17.7%
+
+\section{Visualizations}
+
+<<visualizations, fig.width=14, fig.height=12>>=
+# SECTION 11: Visualizations
+
+# Plot 1: sgRNA1 vs sgRNA2 scatter (LFC)
+p1 <- ggplot(paired_df, aes(x = lfc1, y = lfc2)) +
+  geom_hex(bins = 100) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0, color = "gray50", linetype = "dotted") +
+  geom_vline(xintercept = 0, color = "gray50", linetype = "dotted") +
+  scale_fill_viridis_c(trans = "log10") +
+  labs(title = "sgRNA Concordance (LFC)",
+    subtitle = sprintf("ρ = %.3f, Concordance = %.1f%%", 
+                       cor_spearman, 100 * n_concordant / n_total),
+    x = "sgRNA1 LFC", y = "sgRNA2 LFC") +
+  coord_fixed(xlim = c(-1, 1), ylim = c(-1, 1)) + theme_bw(base_size = 12)
+
+# Plot 2: sgRNA1 vs sgRNA2 scatter (Z-score)
+p2 <- ggplot(paired_df, aes(x = z1, y = z2)) + geom_hex(bins = 100) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0, color = "gray50", linetype = "dotted") +
+  geom_vline(xintercept = 0, color = "gray50", linetype = "dotted") +
+  scale_fill_viridis_c(trans = "log10") + labs(
+    title = "sgRNA Concordance (Z-score)",
+    subtitle = sprintf("ρ = %.3f", cor_z_pearson),
+    x = "sgRNA1 Z-score", y = "sgRNA2 Z-score") +
+  coord_fixed(xlim = c(-5, 5), ylim = c(-5, 5)) + theme_bw(base_size = 12)
+
+# Plot 3: Self-targeted LFC distribution
+p3 <- ggplot(self_targeted, aes(x = lfc)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = median(self_targeted$lfc, na.rm = TRUE), 
+             color = "darkblue", linetype = "solid", linewidth = 1) + labs(
+    title = "Self-Targeted LFC Distribution",
+    subtitle = sprintf("Median = %.3f, %% Positive = %.1f%%",
+                       median(self_targeted$lfc, na.rm = TRUE),
+                       100 * mean(self_targeted$lfc > 0, na.rm = TRUE)),
+    x = "LFC", y = "Count") +
+  theme_bw(base_size = 12)
+
+# Plot 4: Self-targeted Z-score distribution
+p4 <- ggplot(self_targeted, aes(x = zscore)) +
+  geom_histogram(bins = 50, fill = "coral", color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = 1.96, color = "darkgreen", linetype = "dotted", linewidth = 1) +
+  labs(
+    title = "Self-Targeted Z-score Distribution",
+    subtitle = sprintf("Median = %.3f, %% Z > 1.96 = %.1f%%",
+                       median(self_targeted$zscore, na.rm = TRUE),
+                       100 * mean(self_targeted$zscore > 1.96, na.rm = TRUE)),
+    x = "Z-score", y = "Count") + theme_bw(base_size = 12)
+
+# Plot 5: SE distribution
+se_df <- data.frame(se = se_vals[1:min(1000000, length(se_vals))])
+p5 <- ggplot(se_df, aes(x = se)) +
+  geom_histogram(bins = 100, fill = "purple", color = "white") +
+  labs(
+    title = "SE Distribution",
+    subtitle = sprintf("Median = %.4f", median(se_vals)),
+    x = "Standard Error", y = "Count") +
+  xlim(0, quantile(se_vals, 0.99)) + theme_bw(base_size = 12)
+
+# Plot 6: Reliability per protein
+rel_df <- data.frame(protein = names(reliability_per_protein), 
+                      reliability = reliability_per_protein)
+p6 <- ggplot(rel_df, aes(x = reorder(protein, reliability), y = reliability)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_hline(yintercept = mean(reliability_per_protein, na.rm = TRUE), 
+             color = "red", linetype = "dashed") +
+  labs(
+    title = "Reliability per Protein",
+    subtitle = sprintf("Mean = %.3f", mean(reliability_per_protein, na.rm = TRUE)),
+    x = "Protein (ordered)", y = "Reliability"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+# Combine plots
+combined <- (p1 + p2) / (p3 + p4) / (p5 + p6)
+print(combined)
+@
+
+\section{Save Results}
+
+<<save-results>>=
+# Create output directory
+output_dir <- "/home/ec2-user/scitoseq/results/results_sgrna_level"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Save matrices
+saveRDS(lfc_mat, file.path(output_dir, "sgrna_lfc_mat.rds"))
+cat(sprintf("Saved sgrna_lfc_mat: %d × %d\n", nrow(lfc_mat), ncol(lfc_mat)))
+
+saveRDS(se_mat, file.path(output_dir, "sgrna_se_mat.rds"))
+cat(sprintf("Saved sgrna_se_mat: %d × %d\n", nrow(se_mat), ncol(se_mat)))
+
+saveRDS(zscore_mat, file.path(output_dir, "sgrna_zscore_mat.rds"))
+cat(sprintf("Saved sgrna_zscore_mat: %d × %d\n", nrow(zscore_mat), ncol(zscore_mat)))
+
+saveRDS(pval_mat, file.path(output_dir, "sgrna_pval_mat.rds"))
+cat(sprintf("Saved sgrna_pval_mat: %d × %d\n", nrow(pval_mat), ncol(pval_mat)))
+
+saveRDS(qval_mat, file.path(output_dir, "sgrna_qval_mat.rds"))
+cat(sprintf("Saved sgrna_qval_mat: %d × %d\n", nrow(qval_mat), ncol(qval_mat)))
+
+# Save cell counts
+saveRDS(ncells_per_sgrna, file.path(output_dir, "sgrna_ncells.rds"))
+cat(sprintf("Saved sgrna_ncells: %d sgRNAs\n", length(ncells_per_sgrna)))
+
+# Save sgRNA info
+saveRDS(sgrna_info, file.path(output_dir, "sgrna_info.rds"))
+
+# Save paired concordance data
+saveRDS(paired_df, file.path(output_dir, "sgrna_concordance.rds"))
+
+# Save self-targeted data
+saveRDS(self_targeted, file.path(output_dir, "self_targeted_sgrna.rds"))
+saveRDS(self_targeted_paired, file.path(output_dir, "self_targeted_sgrna_paired.rds"))
+
+# Save reliability
+saveRDS(reliability_per_protein, file.path(output_dir, "reliability_per_protein.rds"))
+
+# Create summary table
+summary_df <- data.frame(
+  Metric = c(
+    "Total sgRNAs",
+    "Total proteins", 
+    "Total pairs",
+    "Genes with 2 sgRNAs",
+    "Overall concordance (LFC)",
+    "Spearman correlation (LFC)",
+    "Pearson correlation (Z-score)",
+    "Mean reliability",
+    "Self-targeted pairs",
+    "Self-targeted % positive",
+    "Self-targeted median LFC",
+    "Self-targeted median Z",
+    "Self-targeted concordance",
+    "% p < 0.05",
+    "% FDR < 0.10"
+  ),
+  Value = c(
+    n_sgrnas,
+    n_proteins,
+    n_sgrnas * n_proteins,
+    length(genes_with_2_sgrnas),
+    sprintf("%.1f%%", 100 * n_concordant / n_total),
+    sprintf("%.4f", cor_spearman),
+    sprintf("%.4f", cor_z_pearson),
+    sprintf("%.3f", mean(reliability_per_protein, na.rm = TRUE)),
+    nrow(self_targeted),
+    sprintf("%.1f%%", 100 * mean(self_targeted$lfc > 0, na.rm = TRUE)),
+    sprintf("%.4f", median(self_targeted$lfc, na.rm = TRUE)),
+    sprintf("%.4f", median(self_targeted$zscore, na.rm = TRUE)),
+    sprintf("%.1f%%", 100 * n_conc_self / (n_conc_self + n_disc_self)),
+    sprintf("%.2f%%", 100 * mean(p_vals < 0.05)),
+    sprintf("%.3f%%", 100 * mean(qval_vec < 0.10))
+  )
+)
+
+print(summary_df)
+saveRDS(summary_df, file.path(output_dir, "summary.rds"))
+
+cat(sprintf("\nResults saved to: %s\n", output_dir))
+@
+
+\section{Final Summary}
+
+<<final-summary>>=
+# FINAL SUMMARY: sgRNA-Level LFC, SE, and Z-Score Analysis
+
+cat("METHOD:\n")
+cat("  LFC = mean(sgRNA cells) - mean(NTC cells)\n")
+cat("  SE = sqrt(var_sgRNA/n_sgRNA + var_NTC/n_NTC)\n")
+cat("  Z-score = LFC / SE\n")
+cat("  P-value = 2 * pt(-|Z|, df) with Welch-Satterthwaite df\n")
+cat("  FDR = Benjamini-Hochberg correction\n\n")
+
+cat("KEY RESULTS:\n")
+cat(sprintf("  1. Overall concordance: %.1f%% (vs 50%% chance)\n", 
+            100 * n_concordant / n_total))
+cat(sprintf("  2. sgRNA LFC correlation: ρ = %.4f\n", cor_spearman))
+cat(sprintf("  3. sgRNA Z-score correlation: r = %.4f\n", cor_z_pearson))
+cat(sprintf("  4. Mean reliability (correlation ceiling): %.3f\n", 
+            mean(reliability_per_protein, na.rm = TRUE)))
+cat(sprintf("  5. Self-targeted positive rate: %.1f%% (CRISPRa validation)\n",
+            100 * mean(self_targeted$lfc > 0, na.rm = TRUE)))
+cat(sprintf("  6. Self-targeted concordance: %.1f%%\n",
+            100 * n_conc_self / (n_conc_self + n_disc_self)))
+cat(sprintf("  7. %% FDR < 0.10: %.3f%%\n", 100 * mean(qval_vec < 0.10)))
+@
+
+\end{document}

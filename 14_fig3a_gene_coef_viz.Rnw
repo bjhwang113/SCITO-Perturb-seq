@@ -1,0 +1,136 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+Plot W Matrix: Perturbations × Modules (K=5, L2-Normalized)
+W_rescaled[:,m] = W[:,m] / ||W[:,m]||_2
+After normalization, W columns are unit-norm, all scale info is in H.
+W values are signed: positive = gene pushes proteins along module signature,
+                     negative = gene pushes proteins against module signature.
+                     
+<<>>=
+suppressPackageStartupMessages({
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+# 1. LOAD DATA
+model_k5 <- readRDS("/home/ec2-user/scitoseq/results/semiNMF_v1_analysis/model_k5.rds")
+W5 <- model_k5$W  # 2848 genes × 5 modules
+cat(sprintf("W matrix: %d genes × %d modules\n", nrow(W5), ncol(W5)))
+
+#  2. L2 NORMALIZATION
+d <- sqrt(colSums(W5^2))
+
+cat("\nW column L2 norms before normalization:\n")
+for (m in 1:length(d)) {
+  cat(sprintf("  M%d: ||W[:,m]||_2 = %.3f\n", m, d[m]))
+}
+
+W5_norm <- sweep(W5, 2, d, "/")
+
+# Verify unit norm
+d_after <- sqrt(colSums(W5_norm^2))
+cat("\nW column L2 norms after normalization (should all be 1.000):\n")
+for (m in 1:length(d_after)) {
+  cat(sprintf("  M%d: ||W[:,m]||_2 = %.6f\n", m, d_after[m]))
+}
+
+# Rename modules
+colnames(W5_norm) <- paste0("M", 1:ncol(W5_norm))
+
+cat(sprintf("\nW matrix dimensions: %d perturbations × %d modules\n",
+            nrow(W5_norm), ncol(W5_norm)))
+cat(sprintf("Value range: [%.4f, %.4f]\n", min(W5_norm), max(W5_norm)))
+
+# Per-module summary
+cat("\nPer-module statistics (L2-normalized):\n")
+for (m in colnames(W5_norm)) {
+  vals <- W5_norm[, m]
+  n_pos <- sum(vals > 0)
+  n_neg <- sum(vals < 0)
+  cat(sprintf("  %s: mean=%.4f, sd=%.4f, range=[%.4f, %.4f], %d pos / %d neg\n",
+              m, mean(vals), sd(vals), min(vals), max(vals), n_pos, n_neg))
+}
+
+# 3. COLOR SCALE (diverging, signed W)
+w_abs_cap <- quantile(abs(W5_norm), probs = 0.99, na.rm = TRUE)
+if (!is.finite(w_abs_cap) || w_abs_cap <= 0) {
+  w_abs_cap <- max(abs(W5_norm), na.rm = TRUE)
+}
+cat(sprintf("\nColor cap (99th percentile of |W|): ±%.4f\n", w_abs_cap))
+
+# Cassatt1-inspired diverging: purple-white-red
+col_fun_W <- colorRamp2(
+  breaks = c(-w_abs_cap, 0, w_abs_cap),
+  colors = c("#8282aa", "#FFFFFF", "#ca5c55")
+)
+
+# 4. HEATMAP
+ht_W <- Heatmap(
+  W5_norm,
+  name = "W",
+
+  col    = col_fun_W,
+  na_col = "#E6E6E6",
+
+  # Clustering
+  cluster_rows    = TRUE,
+  cluster_columns = TRUE,
+
+  # Row (gene) settings
+  show_row_names = FALSE,
+  row_title      = "Perturbations (genes)",
+  row_title_gp   = gpar(fontsize = 12, fontface = "bold"),
+  row_title_rot  = 90,
+
+  # Column (module) settings
+  show_column_names     = TRUE,
+  column_names_gp       = gpar(fontsize = 11, fontface = "bold"),
+  column_names_rot      = 0,
+  column_names_centered = TRUE,
+  column_title_gp       = gpar(fontsize = 12, fontface = "bold"),
+
+  # Visual
+  use_raster     = TRUE,
+  raster_quality = 3,
+  border         = TRUE,
+  border_gp      = gpar(col = "grey40", lwd = 0.5),
+
+  # Legend
+  heatmap_legend_param = list(
+    title         = "Gene\nCoefficient",
+    title_gp      = gpar(fontsize = 10, fontface = "bold"),
+    labels_gp     = gpar(fontsize = 9),
+    legend_height = unit(3, "cm"),
+    legend_width  = unit(0.4, "cm"),
+    border        = "grey40",
+    at            = c(-round(w_abs_cap, 3), 0, round(w_abs_cap, 3)),
+    labels        = c(sprintf("%.3f", -w_abs_cap), "0", sprintf("%.3f", w_abs_cap))
+  ),
+
+  # Size
+  width  = unit(4, "cm"),
+  height = unit(16, "cm")
+)
+
+# 5. SAVE
+out_dir <- "/home/ec2-user/scitoseq/fig/fig3"
+out_pdf <- file.path(out_dir, "W_k5_L2norm_perturbation_by_module.pdf")
+pdf(out_pdf, width = 5, height = 8)
+draw(ht_W,
+     heatmap_legend_side = "right",
+     padding = unit(c(1, 1, 1, 1), "mm"))
+dev.off()
+
+# out_png <- file.path(out_dir, "W_k5_L2norm_perturbation_by_module.png")
+# png(out_png, width = 5, height = 8, units = "in", res = 300)
+# draw(ht_W,
+#      heatmap_legend_side = "right",
+#      padding = unit(c(1, 1, 1, 1), "mm"))
+# dev.off()
+@
+
+\end{document}

@@ -1,0 +1,1100 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+\title{Gene-Level LFC, SE, and Z-Score Analysis (PRIMARY)}
+\maketitle
+
+\section{Overview}
+
+This is the \textbf{PRIMARY analysis} (gene-level), consistent with Zhu et al. 2025 methodology.
+Unlike sgRNA-level analysis, we pool ALL cells with ANY sgRNA targeting each gene,
+providing more stable effect estimates.
+
+\textbf{Key difference from sgRNA-level:}
+\begin{itemize}
+  \item sgRNA-level: Each sgRNA analyzed separately (28,104 rows)
+  \item Gene-level: Pool cells from all sgRNAs targeting same gene (17,755 rows)
+\end{itemize}
+
+\textbf{Method:}
+\begin{enumerate}
+  \item For each gene: pool ALL cells with ANY sgRNA targeting that gene
+  \item \textbf{Filter genes with fewer than MIN\_CELLS\_PER\_GENE cells}
+  \item Compute mean and variance across pooled cells
+  \item LFC = gene mean - NTC mean
+  \item SE = sqrt(var\_gene/n\_gene + var\_NTC/n\_NTC)
+  \item Z-score = LFC / SE
+  \item P-values from Welch's t-test (two-sided)
+  \item FDR via Benjamini-Hochberg
+\end{enumerate}
+
+<<load-packages>>=
+# SETUP: Load Packages
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(stringr)
+})
+
+set.seed(42)
+@
+
+\section{Parameters}
+
+<<parameters>>=
+# Minimum number of cells per gene to include in analysis
+# Genes with fewer cells will be filtered out
+# Rationale: With n_cells < 20, variance estimates are unreliable (df < 19)
+# Options: 10 (lenient), 20 (recommended), 30 (conservative)
+MIN_CELLS_PER_GENE <- 20
+
+cat(sprintf("MIN_CELLS_PER_GENE = %d\n", MIN_CELLS_PER_GENE))
+cat("\nRationale: Genes with too few cells have unreliable variance estimates.\n")
+cat("With n=20, df=19 for variance estimation (acceptable for t-test).\n")
+@
+
+\section{Load Data}
+
+<<load-data>>=
+# SECTION 1: Load Batch-Regressed Data
+
+# Load the deviance-normalized (batch-regressed) data
+RAW_RDS <- "/home/ec2-user/scitoseq/data/deviance_norm.rds"
+raw_data <- readRDS(RAW_RDS)
+
+# Clean protein names
+old_names <- rownames(raw_data)
+prefix_pat <- "^(anti-human-mouse-rat-|anti-mouse-human-|anti-human-mouse-|anti-human-|anti-mouse-|Mouse-|Rat-|ArmenianHamsterIgG-)"
+clean_names <- gsub(prefix_pat, "", old_names)
+clean_names <- gsub("-barcode\\d+$", "", clean_names)
+
+# Extract counts and metadata
+counts <- raw_data@assays$RNA@counts
+rownames(counts) <- clean_names
+meta <- raw_data@meta.data
+
+cat(sprintf("Data dimensions: %d proteins × %d cells\n", nrow(counts), ncol(counts)))
+# Data dimensions: 203 proteins × 3134864 cells
+
+rm(raw_data); gc()
+
+# Create clean guide columns
+meta$guide_target_clean <- ifelse(
+  grepl("NO-TARGET", meta$guide_target, ignore.case = TRUE),
+  "NTC", as.character(meta$guide_target))
+meta$guide_target_clean <- factor(meta$guide_target_clean)
+
+meta$guide_assignment_clean <- ifelse(
+  meta$guide_target_clean == "NTC", "NTC", 
+  as.character(meta$guide_assignment))
+
+# Summary
+gene_targets <- setdiff(unique(as.character(meta$guide_target_clean)), "NTC")
+all_sgrnas <- setdiff(unique(meta$guide_assignment_clean), "NTC")
+
+cat(sprintf("Perturbation targets (genes): %d\n", length(gene_targets))) # 17755
+cat(sprintf("sgRNAs (excluding NTC): %d\n", length(all_sgrnas))) # 28104
+cat(sprintf("NTC cells: %d\n", sum(meta$guide_target_clean == "NTC"))) # 26602
+cat(sprintf("Perturbation cells: %d\n", sum(meta$guide_target_clean != "NTC"))) # 3108262
+
+## ---------- Remove IgE / IgLightChainL ----------
+drop_feats <- c("IgE", "IgLightChainL")
+keep_rows  <- !(rownames(counts) %in% drop_feats)
+counts <- counts[keep_rows, , drop = FALSE]
+
+# Protein list
+all_proteins <- rownames(counts)
+n_proteins <- length(all_proteins)
+cat(sprintf("Proteins: %d\n", n_proteins))
+@
+
+Data dimensions: 203 proteins × 3134864 cells
+Perturbation targets (genes): 17755
+sgRNAs (excluding NTC): 28104
+NTC cells: 26602
+Perturbation cells: 3108262
+Proteins: 201
+
+\section{Calculate NTC Statistics}
+
+<<ntc-stats>>=
+# SECTION 2: Calculate NTC Baseline Statistics
+
+# Get NTC cell indices
+ntc_idx <- which(meta$guide_assignment_clean == "NTC")
+n_ntc <- length(ntc_idx)
+cat(sprintf("NTC cells: %d\n", n_ntc))
+
+# NTC counts matrix (proteins × NTC cells)
+counts_ntc <- counts[, ntc_idx, drop = FALSE]
+
+# NTC means (per protein)
+ntc_means <- Matrix::rowMeans(counts_ntc)
+
+# NTC variances (per protein)
+# var(x) = E[x²] - E[x]²
+ntc_sq_means <- Matrix::rowMeans(counts_ntc^2)
+ntc_vars <- ntc_sq_means - ntc_means^2
+
+# Apply Bessel's correction for sample variance: var * n/(n-1)
+ntc_vars <- ntc_vars * n_ntc / (n_ntc - 1)
+
+cat(sprintf("NTC mean range: [%.4f, %.4f]\n", min(ntc_means), max(ntc_means)))
+cat(sprintf("NTC variance range: [%.4f, %.4f]\n", min(ntc_vars), max(ntc_vars)))
+
+rm(counts_ntc); gc()
+@
+
+NTC cells: 26602
+NTC mean range: [-0.0469, 0.0241]
+NTC variance range: [0.8024, 1.4071]
+
+\section{Build Gene-Level Indicator Matrix and Apply Filter}
+
+<<gene-indicator>>=
+# SECTION 3: Build GENE-Level Indicator Matrix and Apply Cell Count Filter
+
+# Get non-NTC cells
+non_ntc_idx <- which(meta$guide_assignment_clean != "NTC")
+n_non_ntc <- length(non_ntc_idx)
+
+# KEY: Use guide_target_clean (gene) instead of guide_assignment_clean (sgRNA)
+gene_assignments <- as.character(meta$guide_target_clean[non_ntc_idx])
+counts_non_ntc <- counts[, non_ntc_idx, drop = FALSE]
+
+# Unique genes (NOT sgRNAs) - BEFORE filtering
+all_unique_genes <- sort(unique(gene_assignments))
+n_genes_total <- length(all_unique_genes)
+
+cat(sprintf("Total genes before filtering: %d\n", n_genes_total))
+cat(sprintf("Total perturbation cells: %d\n", n_non_ntc))
+
+# Count cells per gene BEFORE filtering
+gene_factor_all <- factor(gene_assignments, levels = all_unique_genes)
+ncells_per_gene_all <- table(gene_factor_all)
+ncells_per_gene_all <- as.integer(ncells_per_gene_all)
+names(ncells_per_gene_all) <- all_unique_genes
+
+cat(sprintf("\nCell counts per gene (BEFORE filtering):\n"))
+cat(sprintf("  Min: %d\n", min(ncells_per_gene_all)))
+cat(sprintf("  Median: %.0f\n", median(ncells_per_gene_all)))
+cat(sprintf("  Mean: %.1f\n", mean(ncells_per_gene_all)))
+cat(sprintf("  Max: %d\n", max(ncells_per_gene_all)))
+
+# APPLY CELL COUNT FILTER
+cat(sprintf("\n>>> APPLYING FILTER: n_cells >= %d <<<\n\n", MIN_CELLS_PER_GENE))
+
+genes_passing_filter <- names(ncells_per_gene_all)[ncells_per_gene_all >= MIN_CELLS_PER_GENE]
+genes_failing_filter <- names(ncells_per_gene_all)[ncells_per_gene_all < MIN_CELLS_PER_GENE]
+
+n_genes_pass <- length(genes_passing_filter)
+n_genes_fail <- length(genes_failing_filter)
+
+cat(sprintf("Genes passing filter (n_cells >= %d): %d (%.1f%%)\n", 
+            MIN_CELLS_PER_GENE, n_genes_pass, 100 * n_genes_pass / n_genes_total))
+cat(sprintf("Genes failing filter (n_cells < %d): %d (%.1f%%)\n", 
+            MIN_CELLS_PER_GENE, n_genes_fail, 100 * n_genes_fail / n_genes_total))
+
+# Show distribution of filtered-out genes
+if (n_genes_fail > 0) {
+  filtered_ncells <- ncells_per_gene_all[genes_failing_filter]
+  cat(sprintf("\nFiltered-out genes cell count distribution:\n"))
+  cat(sprintf("  n_cells = 1: %d genes\n", sum(filtered_ncells == 1)))
+  cat(sprintf("  n_cells = 2: %d genes\n", sum(filtered_ncells == 2)))
+  cat(sprintf("  n_cells 3-9: %d genes\n", sum(filtered_ncells >= 3 & filtered_ncells <= 9)))
+  cat(sprintf("  n_cells 10-19: %d genes\n", sum(filtered_ncells >= 10 & filtered_ncells < 20)))
+}
+
+# Use only genes passing filter
+unique_genes <- genes_passing_filter
+n_genes <- length(unique_genes)
+
+# Filter cells to only those belonging to passing genes
+cells_to_keep <- gene_assignments %in% unique_genes
+gene_assignments_filtered <- gene_assignments[cells_to_keep]
+counts_non_ntc_filtered <- counts_non_ntc[, cells_to_keep, drop = FALSE]
+
+cat(sprintf("\nCells retained after gene filtering: %d / %d (%.1f%%)\n",
+            sum(cells_to_keep), length(cells_to_keep), 100 * mean(cells_to_keep)))
+
+# Build indicator matrix for FILTERED genes only
+t_start <- Sys.time()
+
+cat(sprintf("\nBuilding indicator matrix for %d genes (after filtering)...\n", n_genes))
+
+gene_factor <- factor(gene_assignments_filtered, levels = unique_genes)
+
+indicator_mat <- Matrix::sparseMatrix(
+  i = seq_along(gene_assignments_filtered), j = as.integer(gene_factor),
+  x = 1, dims = c(length(gene_assignments_filtered), n_genes),
+  dimnames = list(NULL, unique_genes))
+
+cat(sprintf("Indicator matrix: %d cells × %d genes\n", 
+            nrow(indicator_mat), ncol(indicator_mat)))
+
+# Cell counts per GENE (filtered)
+ncells_per_gene <- Matrix::colSums(indicator_mat)
+names(ncells_per_gene) <- unique_genes
+
+cat(sprintf("\nCell counts per gene (AFTER filtering, n_cells >= %d):\n", MIN_CELLS_PER_GENE))
+cat(sprintf("  Min: %d\n", min(ncells_per_gene)))
+cat(sprintf("  Median: %.0f\n", median(ncells_per_gene)))
+cat(sprintf("  Mean: %.1f\n", mean(ncells_per_gene)))
+cat(sprintf("  Max: %d\n", max(ncells_per_gene)))
+
+# Store unfiltered counts for reference
+ncells_per_gene_unfiltered <- ncells_per_gene_all
+@
+
+Total genes before filtering: 17755
+Total perturbation cells: 3108262
+Cell counts per gene (BEFORE filtering):
+Min: 1
+Median: 147
+Mean: 175.1
+Max: 1266
+
+>>> APPLYING FILTER: n_cells >= 20 <<<
+Genes passing filter (n_cells >= 20): 17336 (97.6%)
+Genes failing filter (n_cells < 20): 419 (2.4%)
+
+Filtered-out genes cell count distribution:
+  n_cells = 1: 2 genes
+  n_cells = 2: 6 genes
+  n_cells 3-9: 138 genes
+  n_cells 10-19: 273 genes
+
+Cells retained after gene filtering: 3103477 / 3108262 (99.8%)
+
+Indicator matrix: 3103477 cells × 17336 genes
+
+Cell counts per gene (AFTER filtering, n_cells >= 20):
+Min: 20
+Median: 150
+Mean: 179.0
+Max: 1266
+
+\section{Calculate Gene-Level Statistics (Vectorized)}
+
+<<gene-stats>>=
+# SECTION 4: Calculate Gene-Level Statistics Using Vectorized Sparse Operations
+
+cat(sprintf("Computing statistics for %d genes across %d proteins...\n", 
+            n_genes, n_proteins))
+
+# STEP 1: Compute sums via sparse matrix multiplication
+# Result: (proteins × genes)
+cat("Computing expression sums...\n")
+gene_sums <- counts_non_ntc_filtered %*% indicator_mat
+gene_sums_dense <- as.matrix(gene_sums)
+
+# STEP 2: Compute sum of squares
+cat("Computing sum of squares...\n")
+counts_sq <- counts_non_ntc_filtered^2
+gene_sumsq <- counts_sq %*% indicator_mat
+gene_sumsq_dense <- as.matrix(gene_sumsq)
+
+# Clean up intermediate
+rm(counts_sq, gene_sums, gene_sumsq, counts_non_ntc_filtered); gc()
+
+# STEP 3: Compute means
+# gene_means is (proteins × genes)
+cat("Computing means...\n")
+gene_means <- sweep(gene_sums_dense, 2, ncells_per_gene, "/")
+
+# STEP 4: Compute variances using: var = E[x²] - E[x]²
+# Then apply Bessel's correction: var * n/(n-1)
+cat("Computing variances...\n")
+gene_sq_means <- sweep(gene_sumsq_dense, 2, ncells_per_gene, "/")
+gene_vars_uncorrected <- gene_sq_means - gene_means^2
+
+# Apply Bessel's correction for sample variance
+# With MIN_CELLS_PER_GENE filter, all genes have n >= threshold
+bessel_factor <- ncells_per_gene / (ncells_per_gene - 1)
+gene_vars <- sweep(gene_vars_uncorrected, 2, bessel_factor, "*")
+
+# Handle negative variances due to numerical precision
+gene_vars[gene_vars < 0] <- 1e-10
+
+rm(gene_sums_dense, gene_sumsq_dense, gene_sq_means, gene_vars_uncorrected); gc()
+
+elapsed <- difftime(Sys.time(), t_start, units = "secs")
+cat(sprintf("\nStatistics computation completed in %.1f seconds\n", elapsed))
+@
+
+Computing statistics for 17336 genes across 201 proteins...
+Statistics computation completed in 21.3 seconds
+
+\section{Calculate LFC, SE, Z-score, and P-values}
+
+<<calculate-lfc-se-zscore>>=
+# SECTION 5: Calculate LFC, SE, Z-score, and P-values
+
+# LFC = gene mean - NTC mean
+# Transpose to get (genes × proteins) format
+cat("Computing LFC...\n")
+gene_lfc_mat <- t(gene_means) - matrix(ntc_means, nrow = n_genes, ncol = n_proteins, byrow = TRUE)
+rownames(gene_lfc_mat) <- unique_genes
+colnames(gene_lfc_mat) <- all_proteins
+
+# SE = sqrt(var_gene/n_gene + var_NTC/n_NTC)
+cat("Computing SE...\n")
+
+# NTC variance contribution (constant for all genes)
+ntc_var_contrib <- ntc_vars / n_ntc
+
+# Gene variance contribution: var_gene / n_gene
+# gene_vars is (proteins × genes)
+gene_var_contrib <- sweep(gene_vars, 2, ncells_per_gene, "/")
+
+# SE² = var_gene/n_gene + var_NTC/n_NTC
+se_squared <- gene_var_contrib + matrix(
+  ntc_var_contrib, nrow = n_proteins, ncol = n_genes, byrow = FALSE)
+
+# SE matrix (transpose to genes × proteins)
+gene_se_mat <- t(sqrt(se_squared))
+rownames(gene_se_mat) <- unique_genes
+colnames(gene_se_mat) <- all_proteins
+
+# Z-score = LFC / SE
+cat("Computing Z-scores...\n")
+gene_zscore_mat <- gene_lfc_mat / gene_se_mat
+
+# P-values from Welch's t-test
+# Welch-Satterthwaite degrees of freedom approximation
+cat("Computing p-values (Welch's t-test)...\n")
+
+# Welch-Satterthwaite df formula
+numerator_df <- se_squared^2
+
+# Term 1: (var_gene/n_gene)² / (n_gene-1)
+term1 <- sweep(gene_var_contrib^2, 2, ncells_per_gene - 1, "/")
+
+# Term 2: (var_NTC/n_NTC)² / (n_NTC-1)
+term2 <- (ntc_var_contrib^2) / (n_ntc - 1)
+
+# Denominator
+denominator_df <- term1 + matrix(term2, nrow = n_proteins, ncol = n_genes, byrow = FALSE)
+
+# Degrees of freedom (proteins × genes)
+df_mat <- numerator_df / denominator_df
+df_mat[df_mat < 1 | is.na(df_mat)] <- 1
+
+# Transpose to (genes × proteins)
+df_mat <- t(df_mat)
+
+# P-values: two-sided t-test
+gene_pval_mat <- 2 * pt(-abs(gene_zscore_mat), df = df_mat)
+
+# Clean up
+rm(se_squared, gene_var_contrib, numerator_df, term1, denominator_df, df_mat); gc()
+
+# FDR Correction (preserve NA structure)
+cat("Computing FDR (Benjamini-Hochberg)...\n")
+
+gene_qval_mat <- gene_pval_mat  # Copy structure
+non_na_idx <- !is.na(gene_pval_mat)
+gene_qval_mat[non_na_idx] <- p.adjust(gene_pval_mat[non_na_idx], method = "BH")
+
+cat("Calculations complete.\n")
+@
+
+\section{Summary Statistics}
+
+<<summary-stats>>=
+# SECTION 6: Summary Statistics
+
+# --- Matrix dimensions ---
+cat("--- Matrix Dimensions (Gene-Level, FILTERED) ---\n")
+cat(sprintf("Filter applied: n_cells >= %d\n", MIN_CELLS_PER_GENE))
+cat(sprintf("LFC matrix: %d genes × %d proteins = %d pairs\n", 
+            nrow(gene_lfc_mat), ncol(gene_lfc_mat), 
+            nrow(gene_lfc_mat) * ncol(gene_lfc_mat)))
+cat(sprintf("Genes removed by filter: %d\n", n_genes_fail))
+
+# --- LFC Summary ---
+cat("\n--- LFC Summary ---\n")
+lfc_vals <- as.vector(gene_lfc_mat[!is.na(gene_lfc_mat)])
+cat(sprintf("Valid (gene, protein) pairs: %d\n", length(lfc_vals)))
+cat(sprintf("Mean LFC: %.4f\n", mean(lfc_vals)))
+cat(sprintf("Median LFC: %.4f\n", median(lfc_vals)))
+cat(sprintf("SD LFC: %.4f\n", sd(lfc_vals)))
+cat(sprintf("Min: %.3f, Max: %.3f\n", min(lfc_vals), max(lfc_vals)))
+cat(sprintf("%% |LFC| > 0.05: %.1f%%\n", 100 * mean(abs(lfc_vals) > 0.05)))
+cat(sprintf("%% |LFC| > 0.10: %.1f%%\n", 100 * mean(abs(lfc_vals) > 0.10)))
+cat(sprintf("%% |LFC| > 0.20: %.1f%%\n", 100 * mean(abs(lfc_vals) > 0.20)))
+
+# --- SE Summary ---
+cat("\n--- SE Summary ---\n")
+se_vals <- as.vector(gene_se_mat[!is.na(gene_se_mat)])
+cat(sprintf("Mean SE: %.4f\n", mean(se_vals)))
+cat(sprintf("Median SE: %.4f\n", median(se_vals)))
+cat(sprintf("SD SE: %.4f\n", sd(se_vals)))
+cat(sprintf("Min: %.4f, Max: %.4f\n", min(se_vals), max(se_vals)))
+
+# --- Z-score Summary ---
+cat("\n--- Z-score Summary ---\n")
+z_vals <- as.vector(gene_zscore_mat[!is.na(gene_zscore_mat) & is.finite(gene_zscore_mat)])
+cat(sprintf("Mean Z: %.4f\n", mean(z_vals)))
+cat(sprintf("Median Z: %.4f\n", median(z_vals)))
+cat(sprintf("SD Z: %.4f (should be ~1 under null)\n", sd(z_vals)))
+cat(sprintf("Min: %.3f, Max: %.3f\n", min(z_vals), max(z_vals)))
+cat(sprintf("%% |Z| > 1.96: %.2f%%\n", 100 * mean(abs(z_vals) > 1.96)))
+cat(sprintf("%% |Z| > 2.58: %.2f%%\n", 100 * mean(abs(z_vals) > 2.58)))
+cat(sprintf("%% |Z| > 3.0: %.2f%%\n", 100 * mean(abs(z_vals) > 3.0)))
+
+# --- P-value Summary ---
+cat("\n--- P-value Summary ---\n")
+p_vals <- as.vector(gene_pval_mat[!is.na(gene_pval_mat)])
+cat(sprintf("%% p < 0.05: %.2f%%\n", 100 * mean(p_vals < 0.05)))
+cat(sprintf("%% p < 0.01: %.2f%%\n", 100 * mean(p_vals < 0.01)))
+cat(sprintf("%% p < 0.001: %.2f%%\n", 100 * mean(p_vals < 0.001)))
+
+# --- FDR Summary ---
+cat("\n--- FDR Summary (Benjamini-Hochberg) ---\n")
+q_vals <- as.vector(gene_qval_mat[!is.na(gene_qval_mat)])
+cat(sprintf("%% FDR < 0.05: %.3f%%\n", 100 * mean(q_vals < 0.05)))
+cat(sprintf("%% FDR < 0.10: %.3f%%\n", 100 * mean(q_vals < 0.10)))
+cat(sprintf("%% FDR < 0.20: %.3f%%\n", 100 * mean(q_vals < 0.20)))
+
+# Count significant hits
+n_fdr05 <- sum(q_vals < 0.05)
+n_fdr10 <- sum(q_vals < 0.10)
+cat(sprintf("\nSignificant hits: %d at FDR<0.05, %d at FDR<0.10\n", n_fdr05, n_fdr10))
+@
+
+Filter applied: n_cells >= 20
+LFC matrix: 17336 genes × 201 proteins = 3484536 pairs
+Genes removed by filter: 419
+--- LFC Summary ---
+Valid (gene, protein) pairs: 3484536
+Mean LFC: 0.0089
+Median LFC: 0.0054
+SD LFC: 0.1025
+Min: -0.820, Max: 8.311
+\% |LFC| > 0.05: 55.7%
+\% |LFC| > 0.10: 26.6%
+\% |LFC| > 0.20: 5.5%
+
+--- SE Summary ---
+Mean SE: 0.0880
+Median SE: 0.0800
+SD SE: 0.0356
+Min: 0.0076, Max: 4.0090
+
+--- Z-score Summary ---
+Mean Z: 0.0476
+Median Z: 0.0687
+SD Z: 1.0878 (should be ~1 under null)
+Min: -17.339, Max: 9.820
+\% |Z| > 1.96: 7.06%
+\ |Z| > 2.58: 1.93%
+\% |Z| > 3.0: 0.74%
+
+--- P-value Summary ---
+\% p < 0.05: 6.77%
+\% p < 0.01: 1.77%
+\% p < 0.001: 0.31%
+
+--- FDR Summary (Benjamini-Hochberg) ---
+\% FDR < 0.05: 0.035%
+\% FDR < 0.10: 0.058%
+\% FDR < 0.20: 0.137%
+Significant hits: 1205 at FDR<0.05, 2012 at FDR<0.10
+
+\section{Build Gene Metadata}
+
+<<gene-metadata>>=
+# SECTION 7: Build Gene Metadata
+
+# Build gene info from sgRNA metadata (for ALL genes, before filtering)
+gene_info_all <- meta %>%
+  filter(guide_assignment_clean != "NTC") %>%
+  group_by(guide_target_clean) %>%
+  summarise(
+    n_sgrnas = n_distinct(guide_assignment_clean),
+    n_cells = n(),
+    batches = paste(sort(unique(Batch)), collapse = ","),
+    .groups = "drop"
+  ) %>%
+  rename(gene = guide_target_clean) %>%
+  mutate(gene = as.character(gene))
+
+# Add filter status
+gene_info_all$passed_filter <- gene_info_all$gene %in% unique_genes
+
+# Gene info for passing genes only
+gene_info <- gene_info_all %>% filter(passed_filter)
+
+cat(sprintf("Total genes: %d\n", nrow(gene_info_all)))
+cat(sprintf("Genes passing filter (n_cells >= %d): %d\n", MIN_CELLS_PER_GENE, nrow(gene_info)))
+
+cat(sprintf("\nsgRNAs per gene distribution (filtered genes):\n"))
+print(table(gene_info$n_sgrnas))
+
+cat(sprintf("\nGenes with 1 sgRNA: %d\n", sum(gene_info$n_sgrnas == 1)))
+cat(sprintf("Genes with 2 sgRNAs: %d\n", sum(gene_info$n_sgrnas == 2)))
+@
+
+Total genes: 17755
+Genes passing filter (n_cells >= 20): 17336
+sgRNAs per gene distribution (filtered genes):
+    1     2 
+ 6993 10343 
+
+Genes with 1 sgRNA: 6993
+Genes with 2 sgRNAs: 10343
+
+\section{Self-Targeted Validation (Gene-Level)}
+
+<<self-targeted>>=
+# SECTION 8: Self-Targeted Validation (Gene-Level)
+
+# Load marker-gene mapping
+marker_gene_df <- readRDS("/home/ec2-user/scitoseq/data/marker_gene_df.rds")
+
+# Build gene-to-marker map (expand semicolon-separated genes)
+marker_gene_tidy <- marker_gene_df %>%
+  mutate(gene_list = str_split(gene, pattern = ";")) %>%
+  mutate(gene_list = lapply(gene_list, function(v) {
+    v <- v[!is.na(v)]
+    v <- trimws(v)
+    v <- v[nzchar(v)]
+    unique(v)
+  }))
+
+gene_to_marker_map <- marker_gene_tidy %>%
+  select(marker, gene_list) %>%
+  unnest_longer(gene_list, values_to = "gene_single") %>%
+  filter(!is.na(gene_single), nzchar(gene_single)) %>%
+  distinct(gene_single, marker)
+
+cat(sprintf("Gene-to-marker mappings: %d\n", nrow(gene_to_marker_map)))
+
+# Find self-targeted pairs at GENE level (only for genes passing filter)
+self_targeted_gene <- data.frame()
+
+for (i in 1:nrow(gene_info)) {
+  gene <- gene_info$gene[i]
+  n_cells <- gene_info$n_cells[i]
+  n_sgrnas <- gene_info$n_sgrnas[i]
+  
+  if (!(gene %in% rownames(gene_lfc_mat))) next
+  
+  # Find proteins encoded by this gene
+  target_proteins <- gene_to_marker_map %>% filter(gene_single == gene) %>%
+    pull(marker)
+  
+  target_proteins <- intersect(target_proteins, colnames(gene_lfc_mat))
+  
+  if (length(target_proteins) == 0) next
+  
+  for (prot in target_proteins) {
+    lfc <- gene_lfc_mat[gene, prot]
+    se <- gene_se_mat[gene, prot]
+    zscore <- gene_zscore_mat[gene, prot]
+    pval <- gene_pval_mat[gene, prot]
+    qval <- gene_qval_mat[gene, prot]
+    
+    self_targeted_gene <- rbind(self_targeted_gene, data.frame(
+      gene = gene, protein = prot, n_cells = n_cells,
+      n_sgrnas = n_sgrnas, lfc = lfc, se = se,
+      zscore = zscore, pval = pval, qval = qval,
+      stringsAsFactors = FALSE))
+  }
+}
+
+cat(sprintf("Self-targeted gene-protein pairs (after filter): %d\n", nrow(self_targeted_gene)))
+cat(sprintf("  Unique genes: %d\n", length(unique(self_targeted_gene$gene))))
+cat(sprintf("  Unique proteins: %d\n", length(unique(self_targeted_gene$protein))))
+
+# Check how many self-targeted genes were filtered out
+self_targeted_genes_all <- gene_to_marker_map$gene_single
+n_self_targeted_filtered <- sum(self_targeted_genes_all %in% genes_failing_filter)
+cat(sprintf("  Self-targeted genes removed by filter: %d\n", n_self_targeted_filtered))
+
+# Self-targeted validation metrics
+cat("\n--- Self-Targeted Validation Metrics (Gene-Level, Filtered) ---\n")
+cat("For CRISPRa, ground truth = positive LFC expected\n\n")
+
+cat(sprintf("Mean LFC: %.4f\n", mean(self_targeted_gene$lfc, na.rm = TRUE)))
+cat(sprintf("Median LFC: %.4f\n", median(self_targeted_gene$lfc, na.rm = TRUE)))
+cat(sprintf("%% Positive: %.1f%%\n", 100 * mean(self_targeted_gene$lfc > 0, na.rm = TRUE)))
+cat(sprintf("%% LFC > 0.10: %.1f%%\n", 100 * mean(self_targeted_gene$lfc > 0.10, na.rm = TRUE)))
+cat(sprintf("%% LFC > 0.50: %.1f%%\n", 100 * mean(self_targeted_gene$lfc > 0.50, na.rm = TRUE)))
+
+cat(sprintf("\nMean Z-score: %.4f\n", mean(self_targeted_gene$zscore, na.rm = TRUE)))
+cat(sprintf("Median Z-score: %.4f\n", median(self_targeted_gene$zscore, na.rm = TRUE)))
+cat(sprintf("%% Z > 1.96: %.1f%%\n", 100 * mean(self_targeted_gene$zscore > 1.96, na.rm = TRUE)))
+cat(sprintf("%% p < 0.05: %.1f%%\n", 100 * mean(self_targeted_gene$pval < 0.05, na.rm = TRUE)))
+cat(sprintf("%% FDR < 0.10: %.1f%%\n", 100 * mean(self_targeted_gene$qval < 0.10, na.rm = TRUE)))
+cat(sprintf("%% FDR < 0.20: %.1f%%\n", 100 * mean(self_targeted_gene$qval < 0.20, na.rm = TRUE)))
+
+# Compare to non-self-targeted as baseline
+non_self_genes <- setdiff(unique_genes, unique(self_targeted_gene$gene))
+non_self_lfc <- as.vector(gene_lfc_mat[non_self_genes, ])
+non_self_lfc <- non_self_lfc[!is.na(non_self_lfc)]
+
+cat("\n--- Baseline (Non-Self-Targeted) ---\n")
+cat(sprintf("Mean LFC: %.4f\n", mean(non_self_lfc)))
+cat(sprintf("Median LFC: %.4f\n", median(non_self_lfc)))
+cat(sprintf("%% Positive: %.1f%%\n", 100 * mean(non_self_lfc > 0)))
+
+# Statistical test
+wilcox_result <- wilcox.test(self_targeted_gene$lfc, non_self_lfc, alternative = "greater")
+cat(sprintf("\nWilcoxon test (self-targeted > non-self-targeted):\n"))
+cat(sprintf("  p-value: %.2e\n", wilcox_result$p.value))
+@
+
+Gene-to-marker mappings: 234
+Self-targeted gene-protein pairs (after filter): 195
+ Unique genes: 185
+ Unique proteins: 177
+Self-targeted genes removed by filter: 2 
+--- Self-Targeted Validation Metrics (Gene-Level, Filtered) ---
+For CRISPRa, ground truth = positive LFC expected
+Mean LFC: 0.7069
+Median LFC: 0.2443
+\% Positive: 83.1%
+\% LFC > 0.10: 65.6%
+\% LFC > 0.50: 37.4%
+
+Mean Z-score: 2.2392
+Median Z-score: 2.0648
+\% Z > 1.96: 50.8%
+\% p < 0.05: 51.8%
+\% FDR < 0.10: 24.1%
+\% FDR < 0.20: 26.7%
+
+--- Baseline (Non-Self-Targeted) ---
+Mean LFC: 0.0089
+Median LFC: 0.0054
+\% Positive: 52.6%
+
+Wilcoxon test (self-targeted > non-self-targeted):
+p-value: 2.80e-49
+
+\section{Reliability Analysis (Gene-Level)}
+
+<<reliability>>=
+# SECTION 9: Reliability / Correlation Ceiling Analysis (Gene-Level)
+
+# Calculate reliability per protein at GENE level
+# reliability = sigma²_true / (sigma²_true + sigma²_error)
+
+reliability_gene_per_protein <- sapply(all_proteins, function(prot) {
+  lfc <- gene_lfc_mat[, prot]
+  se <- gene_se_mat[, prot]
+  
+  # Remove NAs and invalid values
+  valid <- !is.na(lfc) & !is.na(se) & se > 0 & is.finite(lfc) & is.finite(se)
+  lfc <- lfc[valid]
+  se <- se[valid]
+  
+  if (length(lfc) < 10) return(NA)
+  
+  # Variance components
+  sigma2_total <- var(lfc)
+  sigma2_error <- mean(se^2)
+  sigma2_true <- max(0, sigma2_total - sigma2_error)
+  
+  # Reliability
+  reliability <- sigma2_true / (sigma2_true + sigma2_error)
+  return(reliability)
+})
+
+cat("--- Reliability Summary (Gene-Level, Filtered) ---\n")
+cat(sprintf("Mean reliability: %.3f\n", mean(reliability_gene_per_protein, na.rm = TRUE)))
+cat(sprintf("Median reliability: %.3f\n", median(reliability_gene_per_protein, na.rm = TRUE)))
+cat(sprintf("Min reliability: %.3f\n", min(reliability_gene_per_protein, na.rm = TRUE)))
+cat(sprintf("Max reliability: %.3f\n", max(reliability_gene_per_protein, na.rm = TRUE)))
+
+cat("\n--- Interpretation ---\n")
+cat("Reliability reflects fraction of variance that is true signal.\n")
+cat("Low values expected because most gene-protein pairs are true nulls.\n")
+cat("Self-targeted pairs provide better validation of data quality.\n")
+@
+
+--- Reliability Summary (Gene-Level, Filtered) ---
+Mean reliability: 0.113
+Median reliability: 0.085
+Min reliability: 0.000
+Max reliability: 0.522
+--- Interpretation ---
+Reliability reflects fraction of variance that is true signal.
+Low values expected because most gene-protein pairs are true nulls.
+Self-targeted pairs provide better validation of data quality.
+
+\section{Top Hits by Z-score}
+
+<<top-hits>>=
+# SECTION 10: Top Hits by Z-score
+
+# Convert to long format for ranking
+hits_df <- data.frame(
+  gene = rep(rownames(gene_lfc_mat), ncol(gene_lfc_mat)),
+  protein = rep(colnames(gene_lfc_mat), each = nrow(gene_lfc_mat)),
+  lfc = as.vector(gene_lfc_mat),
+  se = as.vector(gene_se_mat),
+  zscore = as.vector(gene_zscore_mat),
+  pval = as.vector(gene_pval_mat),
+  qval = as.vector(gene_qval_mat)
+)
+
+# Add cell counts
+hits_df$n_cells <- ncells_per_gene[hits_df$gene]
+
+# Mark self-targeted
+hits_df$self_targeted <- paste(hits_df$gene, hits_df$protein, sep = "_") %in%
+  paste(self_targeted_gene$gene, self_targeted_gene$protein, sep = "_")
+
+# Remove NAs
+hits_df <- hits_df %>% filter(!is.na(zscore) & is.finite(zscore))
+
+cat(sprintf("Total gene-protein pairs (after filtering): %d\n", nrow(hits_df)))
+cat(sprintf("Min n_cells in results: %d (should be >= %d)\n", 
+            min(hits_df$n_cells), MIN_CELLS_PER_GENE))
+
+# Top positive Z-scores (upregulation)
+cat("\n--- Top 20 Positive Z-scores (Upregulation) ---\n")
+top_pos <- hits_df %>% arrange(desc(zscore)) %>% head(20) %>% mutate(
+    lfc = round(lfc, 3), zscore = round(zscore, 2),
+    qval = formatC(qval, format = "e", digits = 2)) %>%
+  dplyr::select(gene, protein, lfc, zscore, qval, n_cells, self_targeted)
+
+print(top_pos, row.names = FALSE)
+
+# Top negative Z-scores (downregulation)
+cat("\n--- Top 20 Negative Z-scores (Downregulation) ---\n")
+top_neg <- hits_df %>% arrange(zscore) %>% head(20) %>% mutate(
+    lfc = round(lfc, 3), zscore = round(zscore, 2),
+    qval = formatC(qval, format = "e", digits = 2)) %>%
+  dplyr::select(gene, protein, lfc, zscore, qval, n_cells, self_targeted)
+
+print(top_neg, row.names = FALSE)
+
+# Top self-targeted hits
+cat("\n--- Top 20 Self-Targeted Hits by Z-score ---\n")
+top_self <- hits_df %>% filter(self_targeted) %>%
+  arrange(desc(zscore)) %>% head(20) %>% mutate(
+    lfc = round(lfc, 3), zscore = round(zscore, 2),
+    qval = formatC(qval, format = "e", digits = 2)) %>%
+  dplyr::select(gene, protein, lfc, zscore, qval, n_cells)
+
+print(top_self, row.names = FALSE)
+@
+
+Total gene-protein pairs (after filtering): 3484536
+Min n_cells in results: 20 (should be >= 20)
+--- Top 20 Positive Z-scores (Upregulation) ---
+   gene      protein   lfc zscore     qval n_cells self_targeted
+     CD38        CD244 1.563   9.82 1.53e-14     371         FALSE
+     CD38         CD38 4.249   9.45 1.92e-13     371          TRUE
+     CD38        CD131 1.416   8.98 4.31e-12     371         FALSE
+    OLIG2       HLA-DQ 0.679   8.75 1.91e-11     370         FALSE
+    OLIG2       HLA-DR 0.628   8.61 4.42e-11     370         FALSE
+    KIF2B        CD146 2.080   8.54 2.41e-10     255         FALSE
+    CD244        CD244 1.922   8.19 1.59e-09     239          TRUE
+    OLIG2 HLA-DR-DP-DQ 0.696   8.09 1.07e-09     370         FALSE
+    EFNA4        CD223 1.053   8.04 6.05e-10     711         FALSE
+    OLIG2    TCR-Va7.2 0.661   8.01 1.52e-09     370         FALSE
+   RAB33B          CD5 0.956   7.84 6.67e-08     143         FALSE
+     NAPG        CD146 1.022   7.75 9.05e-09     334         FALSE
+    PAICS        CD146 1.631   7.63 9.45e-09     486         FALSE
+    OLIG2         CD52 0.522   7.45 4.75e-08     370         FALSE
+    RBMS3        CD11c 1.576   7.44 6.75e-07     131         FALSE
+     RER1         CD46 0.981   7.31 1.84e-07     276         FALSE
+    DPEP3        CD146 2.641   7.24 4.13e-06     102         FALSE
+    EFNA4         C5L2 0.823   7.17 1.31e-07     711         FALSE
+     SELL        CD62L 2.239   7.03 1.09e-06     249          TRUE
+ TNFRSF1B       CD120b 0.641   6.92 1.03e-06     382          TRUE
+ 
+--- Top 20 Negative Z-scores (Downregulation) ---
+    gene    protein    lfc zscore     qval n_cells self_targeted
+   TBCCD1       CD33 -0.396 -17.34 1.07e-09      21         FALSE
+     UCK1       CD33 -0.447 -16.30 1.43e-09      23         FALSE
+     PRKX      CD161 -0.234 -13.79 7.91e-16      56         FALSE
+      MAL      CD161 -0.303 -12.93 2.67e-13      53         FALSE
+   CDKN1B      CD11c -0.169 -12.68 6.11e-21     121         FALSE
+   ACTR10 TCR-Vb13.1 -0.428 -11.78 1.85e-09      38         FALSE
+  SLCO1B3      CD11c -0.148 -11.48 3.19e-17     108         FALSE
+     C1QC      CD11c -0.191 -11.35 1.43e-09      33         FALSE
+  SLCO1C1     HLA-A2 -0.413 -11.17 2.31e-07      29         FALSE
+    OARD1      CD11c -0.185 -11.02 3.94e-12      59         FALSE
+    ATXN1      TCRrd -0.574 -10.97 1.04e-05      22         FALSE
+ ADAMTS20      CD11c -0.164 -10.91 6.29e-14      82         FALSE
+     CD86      CD11c -0.204 -10.61 5.41e-10      47         FALSE
+   PDLIM7      CD11c -0.157 -10.61 1.08e-14     118         FALSE
+    ITM2A       CD14 -0.330 -10.61 2.79e-09      46         FALSE
+   POU6F2       CD14 -0.535 -10.25 7.20e-05      20         FALSE
+    PHGDH      CD161 -0.256 -10.03 8.43e-09      47         FALSE
+    SUDS3      CD11c -0.144  -9.98 8.31e-13     100         FALSE
+    CPSF2      CD161 -0.373  -9.87 8.04e-09      53         FALSE
+    CEPT1      CD186 -0.392  -9.84 1.05e-05      26         FALSE
+    
+--- Top 20 Self-Targeted Hits by Z-score ---
+   gene         protein   lfc zscore     qval n_cells
+     CD38            CD38 4.249   9.45 1.92e-13     371
+    CD244           CD244 1.922   8.19 1.59e-09     239
+     SELL           CD62L 2.239   7.03 1.09e-06     249
+ TNFRSF1B          CD120b 0.641   6.92 1.03e-06     382
+     MICA       MICA-MICB 2.155   6.79 1.02e-05     148
+     CD81            CD81 0.941   6.76 4.05e-06     270
+     GGT1           CD224 1.712   6.58 6.43e-06     394
+    LAIR1           CD305 4.177   6.47 2.60e-05     191
+     NT5E            CD73 1.965   6.41 2.03e-05     295
+   B3GAT1 CD57Recombinant 3.855   6.37 2.30e-05     314
+     CD70            CD70 1.498   6.33 2.27e-05     381
+     CCR4           CD194 1.053   6.29 9.53e-05     141
+  TNFRSF4           CD134 3.451   5.71 8.86e-04     171
+    IL3RA           CD123 2.022   5.52 1.37e-03     228
+     CD72            CD72 1.259   5.50 1.17e-03     348
+   ADGRG1           GPR56 1.083   5.49 1.34e-03     281
+    CD101           CD101 4.673   5.49 2.14e-03     150
+      ENG           CD105 1.804   5.42 1.58e-03     334
+ TNFRSF18           CD357 1.725   5.35 2.40e-03     243
+     BTLA           CD272 0.629   5.26 3.57e-03     221
+     
+
+\section{Visualizations}
+
+<<visualizations, fig.width=14, fig.height=12>>=
+# SECTION 11: Visualizations
+
+# Plot 1: LFC distribution (gene-level)
+p1 <- ggplot(
+  data.frame(lfc = lfc_vals[1:min(500000, length(lfc_vals))]), aes(x = lfc)) +
+  geom_histogram(bins = 100, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Gene-Level LFC Distribution",
+    subtitle = sprintf("n_cells >= %d | Median = %.4f, SD = %.4f", 
+                       MIN_CELLS_PER_GENE, median(lfc_vals), sd(lfc_vals)),
+    x = "LFC", y = "Count") + xlim(-1, 1) + theme_bw(base_size = 12)
+
+# Plot 2: Z-score distribution (gene-level)
+p2 <- ggplot(data.frame(z = z_vals[1:min(500000, length(z_vals))]), aes(x = z)) +
+  geom_histogram(bins = 100, fill = "coral", color = "white") +
+  geom_vline(xintercept = c(-1.96, 1.96), color = "darkgreen", linetype = "dotted") +
+  labs(title = "Gene-Level Z-score Distribution",
+    subtitle = sprintf("n_cells >= %d | SD = %.3f, %% |Z|>1.96 = %.1f%%", 
+                       MIN_CELLS_PER_GENE, sd(z_vals), 100 * mean(abs(z_vals) > 1.96)),
+    x = "Z-score", y = "Count") + xlim(-5, 5) +
+  theme_bw(base_size = 12)
+
+# Plot 3: Self-targeted LFC distribution (gene-level)
+p3 <- ggplot(self_targeted_gene, aes(x = lfc)) +
+  geom_histogram(bins = 40, fill = "darkgreen", color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = median(self_targeted_gene$lfc, na.rm = TRUE), 
+             color = "blue", linetype = "solid", linewidth = 1) +
+  labs(
+    title = "Self-Targeted LFC (Gene-Level)",
+    subtitle = sprintf("Median = %.3f, %% Positive = %.1f%%",
+                       median(self_targeted_gene$lfc, na.rm = TRUE),
+                       100 * mean(self_targeted_gene$lfc > 0, na.rm = TRUE)),
+    x = "LFC", y = "Count") + theme_bw(base_size = 12)
+
+# Plot 4: Self-targeted Z-score distribution (gene-level)
+p4 <- ggplot(self_targeted_gene, aes(x = zscore)) +
+  geom_histogram(bins = 40, fill = "purple", color = "white") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = 1.96, color = "darkgreen", linetype = "dotted", linewidth = 1) +
+  labs(
+    title = "Self-Targeted Z-score (Gene-Level)",
+    subtitle = sprintf("Median = %.3f, %% Z > 1.96 = %.1f%%",
+                       median(self_targeted_gene$zscore, na.rm = TRUE),
+                       100 * mean(self_targeted_gene$zscore > 1.96, na.rm = TRUE)),
+    x = "Z-score", y = "Count") + theme_bw(base_size = 12)
+
+# Plot 5: SE distribution (gene-level)
+p5 <- ggplot(data.frame(se = se_vals[1:min(500000, length(se_vals))]), 
+             aes(x = se)) +
+  geom_histogram(bins = 100, fill = "orange", color = "white") + labs(
+    title = "Gene-Level SE Distribution",
+    subtitle = sprintf("n_cells >= %d | Median = %.4f", MIN_CELLS_PER_GENE, median(se_vals)),
+    x = "Standard Error", y = "Count") +
+  xlim(0, quantile(se_vals, 0.99)) + theme_bw(base_size = 12)
+
+# Plot 6: Volcano plot
+volcano_sample <- hits_df %>% sample_n(min(100000, nrow(hits_df)))
+
+p6 <- ggplot(volcano_sample, aes(x = lfc, y = -log10(pval), color = self_targeted)) +
+  geom_point(alpha = 0.3, size = 0.5) +
+  geom_hline(yintercept = -log10(0.05), color = "red", linetype = "dashed") +
+  geom_vline(xintercept = c(-0.1, 0.1), color = "blue", linetype = "dotted") +
+  scale_color_manual(values = c("FALSE" = "gray50", "TRUE" = "red")) +
+  labs(
+    title = "Volcano Plot (Gene-Level)",
+    subtitle = sprintf("n_cells >= %d | Red points = self-targeted", MIN_CELLS_PER_GENE),
+    x = "LFC", y = "-log10(p-value)") +
+  xlim(-1.5, 1.5) + theme_bw(base_size = 12) + theme(legend.position = "none")
+
+combined <- (p1 + p2) / (p3 + p4) / (p5 + p6)
+print(combined)
+@
+
+\section{Save Results}
+
+<<save-results>>=
+# Create output directory (include filter parameter in name for clarity)
+output_dir <- "/home/ec2-user/scitoseq/results/results_gene_level"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Save analysis parameters
+params <- list(
+  MIN_CELLS_PER_GENE = MIN_CELLS_PER_GENE, n_genes_total = n_genes_total,
+  n_genes_filtered = n_genes, n_genes_removed = n_genes_fail,
+  analysis_date = Sys.Date())
+saveRDS(params, file.path(output_dir, "analysis_params.rds"))
+cat(sprintf("Saved analysis_params.rds (MIN_CELLS = %d)\n", MIN_CELLS_PER_GENE))
+
+# Save matrices
+saveRDS(gene_lfc_mat, file.path(output_dir, "gene_lfc_mat.rds"))
+cat(sprintf("Saved gene_lfc_mat: %d × %d\n", nrow(gene_lfc_mat), ncol(gene_lfc_mat)))
+
+saveRDS(gene_se_mat, file.path(output_dir, "gene_se_mat.rds"))
+cat(sprintf("Saved gene_se_mat: %d × %d\n", nrow(gene_se_mat), ncol(gene_se_mat)))
+
+saveRDS(gene_zscore_mat, file.path(output_dir, "gene_zscore_mat.rds"))
+cat(sprintf("Saved gene_zscore_mat: %d × %d\n", nrow(gene_zscore_mat), ncol(gene_zscore_mat)))
+
+saveRDS(gene_pval_mat, file.path(output_dir, "gene_pval_mat.rds"))
+cat(sprintf("Saved gene_pval_mat: %d × %d\n", nrow(gene_pval_mat), ncol(gene_pval_mat)))
+
+saveRDS(gene_qval_mat, file.path(output_dir, "gene_qval_mat.rds"))
+cat(sprintf("Saved gene_qval_mat: %d × %d\n", nrow(gene_qval_mat), ncol(gene_qval_mat)))
+
+# Save cell counts (both filtered and unfiltered)
+saveRDS(ncells_per_gene, file.path(output_dir, "gene_ncells.rds"))
+cat(sprintf("Saved gene_ncells: %d genes (filtered)\n", length(ncells_per_gene)))
+
+saveRDS(ncells_per_gene_unfiltered, file.path(output_dir, "gene_ncells_unfiltered.rds"))
+cat(sprintf("Saved gene_ncells_unfiltered: %d genes (all)\n", length(ncells_per_gene_unfiltered)))
+
+# Save gene info (both filtered and all)
+saveRDS(gene_info, file.path(output_dir, "gene_info.rds"))
+saveRDS(gene_info_all, file.path(output_dir, "gene_info_all.rds"))
+
+# Save self-targeted data
+saveRDS(self_targeted_gene, file.path(output_dir, "self_targeted_gene.rds"))
+
+# Save reliability
+saveRDS(reliability_gene_per_protein, file.path(output_dir, "reliability_gene_per_protein.rds"))
+
+# Save top hits
+saveRDS(hits_df, file.path(output_dir, "all_hits_df.rds"))
+
+# Create summary table
+summary_gene <- data.frame(
+  Metric = c(
+    "Analysis Level",
+    "MIN_CELLS_PER_GENE filter",
+    "Total genes (before filter)",
+    "Genes passing filter",
+    "Genes removed by filter",
+    "Total proteins", 
+    "Total pairs (filtered)",
+    "Median cells per gene",
+    "Median SE",
+    "Z-score SD",
+    "% |Z| > 1.96",
+    "% p < 0.05",
+    "% FDR < 0.05",
+    "% FDR < 0.10",
+    "Mean reliability",
+    "Self-targeted pairs",
+    "Self-targeted % positive",
+    "Self-targeted median LFC",
+    "Self-targeted median Z",
+    "Self-targeted % Z > 1.96",
+    "Self-targeted % FDR < 0.10"
+  ),
+  Value = c(
+    "GENE (PRIMARY)",
+    as.character(MIN_CELLS_PER_GENE),
+    as.character(n_genes_total),
+    as.character(n_genes),
+    as.character(n_genes_fail),
+    as.character(n_proteins),
+    as.character(n_genes * n_proteins),
+    sprintf("%.0f", median(ncells_per_gene)),
+    sprintf("%.4f", median(se_vals)),
+    sprintf("%.3f", sd(z_vals)),
+    sprintf("%.2f%%", 100 * mean(abs(z_vals) > 1.96)),
+    sprintf("%.2f%%", 100 * mean(p_vals < 0.05)),
+    sprintf("%.3f%%", 100 * mean(q_vals < 0.05)),
+    sprintf("%.3f%%", 100 * mean(q_vals < 0.10)),
+    sprintf("%.3f", mean(reliability_gene_per_protein, na.rm = TRUE)),
+    as.character(nrow(self_targeted_gene)),
+    sprintf("%.1f%%", 100 * mean(self_targeted_gene$lfc > 0, na.rm = TRUE)),
+    sprintf("%.4f", median(self_targeted_gene$lfc, na.rm = TRUE)),
+    sprintf("%.4f", median(self_targeted_gene$zscore, na.rm = TRUE)),
+    sprintf("%.1f%%", 100 * mean(self_targeted_gene$zscore > 1.96, na.rm = TRUE)),
+    sprintf("%.1f%%", 100 * mean(self_targeted_gene$qval < 0.10, na.rm = TRUE))
+  )
+)
+
+print(summary_gene)
+saveRDS(summary_gene, file.path(output_dir, "summary_gene.rds"))
+
+cat(sprintf("\nResults saved to: %s\n", output_dir))
+@
+
+                        Metric          Value
+1               Analysis Level GENE (PRIMARY)
+2    MIN_CELLS_PER_GENE filter             20
+3  Total genes (before filter)          17755
+4         Genes passing filter          17336
+5      Genes removed by filter            419
+6               Total proteins            201
+7       Total pairs (filtered)        3484536
+8        Median cells per gene            150
+9                    Median SE         0.0800
+10                  Z-score SD          1.088
+11                % |Z| > 1.96          7.06%
+12                  % p < 0.05          6.77%
+13                % FDR < 0.05         0.035%
+14                % FDR < 0.10         0.058%
+15            Mean reliability          0.113
+16         Self-targeted pairs            195
+17    Self-targeted % positive          83.1%
+18    Self-targeted median LFC         0.2443
+19      Self-targeted median Z         2.0648
+20    Self-targeted % Z > 1.96          50.8%
+21  Self-targeted % FDR < 0.10          24.1%
+
+\section{Final Summary}
+
+<<final-summary>>=
+cat("PARAMETERS:\n")
+cat(sprintf("  MIN_CELLS_PER_GENE = %d\n", MIN_CELLS_PER_GENE))
+cat(sprintf("  Genes removed by filter: %d (%.1f%%)\n", 
+            n_genes_fail, 100 * n_genes_fail / n_genes_total))
+
+cat("\nMETHOD:\n")
+cat("  Pool ALL cells with ANY sgRNA targeting each gene\n")
+cat(sprintf("  Filter genes with n_cells < %d\n", MIN_CELLS_PER_GENE))
+cat("  LFC = mean(gene cells) - mean(NTC cells)\n")
+cat("  SE = sqrt(var_gene/n_gene + var_NTC/n_NTC)\n")
+cat("  Z-score = LFC / SE\n")
+cat("  P-value = Welch's t-test\n")
+cat("  FDR = Benjamini-Hochberg\n\n")
+
+cat("KEY RESULTS:\n")
+cat(sprintf("  1. Matrix dimensions: %d genes × %d proteins\n", n_genes, n_proteins))
+cat(sprintf("  2. Median cells per gene: %.0f\n", median(ncells_per_gene)))
+cat(sprintf("  3. Median SE: %.4f\n", median(se_vals)))
+cat(sprintf("  4. Z-score SD: %.3f (should be ~1 under null)\n", sd(z_vals)))
+cat(sprintf("  5. %% FDR < 0.10: %.3f%%\n", 100 * mean(q_vals < 0.10)))
+cat(sprintf("  6. Self-targeted positive rate: %.1f%%\n",
+            100 * mean(self_targeted_gene$lfc > 0, na.rm = TRUE)))
+cat(sprintf("  7. Self-targeted %% Z > 1.96: %.1f%%\n",
+            100 * mean(self_targeted_gene$zscore > 1.96, na.rm = TRUE)))
+@
+
+\end{document}

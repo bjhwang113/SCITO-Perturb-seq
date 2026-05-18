@@ -1,0 +1,340 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+W-Axis Scatter — "Composite Phenotype Landscape" (k=5, L2-Normalized)
+
+Each dot = one gene perturbation, positioned by its L2-normalized W
+coefficients on two anti-correlated module axes.
+
+1. Axis limits set to 99.5th percentile of |W| on each axis pair,
+   so the data cloud fills the plot area (extreme outliers clipped)
+2. Non-T-cell genes (neural, epithelial, etc.) excluded from labeling
+3. Immune genes: firebrick red circles and bold labels
+4. Top novel genes by 2D distance: steel blue circles and bold labels
+5. Unlabeled strong genes shown as black points
+  
+<<>>=
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(ggrepel)
+  library(dplyr)
+  library(patchwork)
+})
+
+INPUT_DIR  <- "/home/ec2-user/scitoseq/results/semiNMF_v1_analysis"
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/fig/fig3"
+
+modules <- paste0("M", 1:5)
+
+MODULE_NAMES <- c(
+  "M1" = "Adhesion & Immune Regulation",
+  "M2" = "Tissue / Innate-like",
+  "M3" = "Resting / Naive",
+  "M4" = "Activation / Proliferation",
+  "M5" = "Effector / Exhaustion"
+)
+
+MODULE_COLORS <- c(
+  "M1" = "#da7901",
+  "M2" = "#20235b",
+  "M3" = "#637b31",
+  "M4" = "#7B2D8E",
+  "M5" = "#f0be3d"
+)
+
+# Label colors
+IMMUNE_LABEL_COLOR <- "#6D1A36"   # Dark maroon — validated immune genes
+NOVEL_LABEL_COLOR  <- "#00796B"   # Deep teal — novel discovery genes
+
+# Curated immune genes for labeling
+IMMUNE_GENES <- c(
+    # Known immune regulators from original list
+  "IL2RA", "IL2RB", "IL15RA", "IL12B",
+  "PDCD1", "CTLA4", "LAG3", "ICOS",
+  "CD28", "CD27", "CD40LG", "TNFRSF4", "TNFRSF1B", "TNFRSF1A", # "TNFRSF9", 
+  "CARD11", "NFKB1", "RELA",
+  "PRDM1", "STAT5A",
+  "GZMA", "FASLG",
+  "CXCR3", "CXCR4",
+  "S1PR1", "PTPN6", "MAP3K8",
+  # Literature-supported from audit
+  "CD244", "CD69", "STX11", "GNAI2", "SORT1",
+  "CSF2", "LYN", "PECAM1", "RIPOR1",
+  "TAB2", "CASP6", "CTSC", "PSTPIP1",
+  "IL17RA", "ALOX5AP", "SIRPA", "MAP2K2",
+  "MYLIP", "SLPI", "CD19"
+)
+
+# Non-T-cell genes to exclude from novel labeling
+# (neural, epithelial, sensory, developmental genes with no known T cell role)
+NON_TCELL_GENES <- c(
+  # Neural / brain
+  "OLIG2", "OLIG1", "NEUROD1", "NEUROD2", "NEUROG1", "NEUROG2",
+  "RBMS3", "ARPP21", "NPY4R", "RFX6",
+  # Ion channels / epithelial
+  "FXYD2", "FXYD3", "FXYD4",
+  # Other clearly non-immune
+  "SLC6A4",    # serotonin transporter
+  "PAICS",     # purine biosynthesis (ubiquitous but no T cell relevance)
+  "SEC14L4",   # lipid transport
+  "KIAA0586",  # ciliary (Talpid3)
+  "ERCC6L",    # DNA repair / mitotic
+  "BANF2"      # nuclear envelope
+)
+
+
+# 1. LOAD AND L2-NORMALIZE
+cat("Loading k=5 semi-NMF model...\n")
+model_k5 <- readRDS(file.path(INPUT_DIR, "model_k5.rds"))
+W_raw <- model_k5$W
+
+colnames(W_raw) <- modules
+
+d <- sqrt(colSums(W_raw^2))
+W <- sweep(W_raw, 2, d, "/")
+
+cat(sprintf("W: %d genes × %d modules (L2-normalized)\n", nrow(W), ncol(W)))
+
+# Threshold
+W_STRONG <- quantile(abs(as.vector(W)), probs = 0.90)
+cat(sprintf("Threshold (90th %%ile): %.5f\n", W_STRONG))
+
+
+# 2. BUILD GENE DATA FRAME
+gene_df <- data.frame(
+  gene = rownames(W),
+  M1 = W[, "M1"], M2 = W[, "M2"], M3 = W[, "M3"],
+  M4 = W[, "M4"], M5 = W[, "M5"],
+  stringsAsFactors = FALSE
+)
+gene_df$is_immune    <- gene_df$gene %in% IMMUNE_GENES
+gene_df$is_non_tcell <- gene_df$gene %in% NON_TCELL_GENES
+
+gene_df$max_abs      <- apply(abs(W), 1, max)
+gene_df$primary      <- modules[apply(abs(W), 1, which.max)]
+gene_df$is_strong    <- gene_df$max_abs >= W_STRONG
+
+cat(sprintf("Immune genes in data: %d\n", sum(gene_df$is_immune)))
+cat(sprintf("Non-T-cell genes flagged: %d\n", sum(gene_df$is_non_tcell)))
+
+# --- Diagnostic: identify the top-left outlier for M1 vs M3 ---
+cat("\n--- Top-left outlier check (low M1, high M3) ---\n")
+top_left <- gene_df %>%
+  mutate(.dist_topleft = sqrt(M1^2 + M3^2)) %>%
+  filter(M1 < -0.05, M3 > 0.02) %>%
+  arrange(desc(.dist_topleft)) %>%
+  head(5)
+print(top_left[, c("gene", "M1", "M3", "is_immune", "is_non_tcell", "is_strong")])
+cat("If the unlabeled outlier is in NON_TCELL_GENES, consider removing it.\n\n")
+@
+
+<<>>=
+plot_axis_scatter <- function(df, mx, my, mx_name, my_name,
+                              mx_color, my_color,
+                              n_novel_label = 10,
+                              axis_quantile = 0.995) {
+
+  xvals <- df[[mx]]
+  yvals <- df[[my]]
+
+  # ── Axis limits: clip to quantile so data fills the space ──
+  x_cap <- quantile(abs(xvals), probs = axis_quantile)
+  y_cap <- quantile(abs(yvals), probs = axis_quantile)
+  ax_cap <- max(x_cap, y_cap) * 1.08
+
+  # ── Select genes to label ──
+  df$label_gene <- FALSE
+
+  # Immune genes that pass the strong threshold
+  immune_mask <- df$is_immune & df$is_strong
+  df$label_gene[immune_mask] <- TRUE
+
+  # Novel genes: top by 2D distance, not immune, not non-T-cell
+  df$.dist2d <- sqrt(xvals^2 + yvals^2)
+  novel_candidates <- df %>%
+    filter(!is_immune, !is_non_tcell, is_strong) %>%
+    arrange(desc(.dist2d)) %>%
+    head(n_novel_label)
+  df$label_gene[df$gene %in% novel_candidates$gene] <- TRUE
+
+  # Exclude non-T-cell genes from labeling
+  df$label_gene[df$is_non_tcell] <- FALSE
+
+  # ── Assign label type for color mapping ──
+  df$label_type <- case_when(
+    df$label_gene & df$is_immune  ~ "Immune",
+    df$label_gene & !df$is_immune ~ "Novel",
+    TRUE                          ~ "None"
+  )
+
+  # Subsets for layering
+  df_strong_unlabeled <- df[df$is_strong & !df$label_gene & !df$is_non_tcell, ]
+  #df_strong_unlabeled <- df[df$is_strong & !df$label_gene, ]
+  df_labeled_immune   <- df[df$label_type == "Immune", ]
+  df_labeled_novel    <- df[df$label_type == "Novel", ]
+  df_labeled_all      <- df[df$label_gene, ]
+  
+  # Combine all labeled genes into one layer
+df_labeled_all <- df[df$label_gene, ]
+df_labeled_all$label_color <- ifelse(df_labeled_all$is_immune,
+                                      IMMUNE_LABEL_COLOR,
+                                      NOVEL_LABEL_COLOR)
+#df_labeled_all$label_face <- ifelse(df_labeled_all$is_immune,
+#                                     "bold", "bold.italic")
+
+  p <- ggplot(df, aes(x = .data[[mx]], y = .data[[my]])) +
+
+    # Layer 1: strong but unlabeled genes (grey)
+    geom_point(data = df_strong_unlabeled,
+               size = 1.0, color = "black", alpha = 0.5) +
+
+    # Layer 2: labeled immune genes
+    geom_point(data = df_labeled_immune,
+               size = 2.0, color = IMMUNE_LABEL_COLOR, alpha = 0.8) +
+
+    # Layer 3: labeled novel genes
+    geom_point(data = df_labeled_novel,
+               size = 2.0, color = NOVEL_LABEL_COLOR, alpha = 0.8) +
+
+    # # Labels: immune genes (red)
+    # geom_text_repel(
+    #   data = df_labeled_immune,
+    #   aes(label = gene),
+    #   size = 3.8, max.overlaps = 35,
+    #   fontface = "bold",
+    #   color = IMMUNE_LABEL_COLOR,
+    #   bg.color = "white", bg.r = 0.15,
+    #   segment.color = IMMUNE_LABEL_COLOR, segment.size = 0.3,
+    #   box.padding = 0.4, point.padding = 0.25,
+    #   force = 3, seed = 42,
+    #   min.segment.length = 0.3
+    # ) +
+    # 
+    # # Labels: novel genes (blue)
+    # geom_text_repel(
+    #   data = df_labeled_novel,
+    #   aes(label = gene),
+    #   size = 3.8, max.overlaps = 35,
+    #   fontface = "bold.italic",
+    #   color = NOVEL_LABEL_COLOR,
+    #   bg.color = "white", bg.r = 0.15,
+    #   segment.color = NOVEL_LABEL_COLOR, segment.size = 0.3,
+    #   box.padding = 0.4, point.padding = 0.25,
+    #   force = 3, seed = 42,
+    #   min.segment.length = 0.3
+    # ) +
+    # Add after the existing geom_point layers, before geom_text_repel
+geom_point(data = df_labeled_all,
+           aes(color = label_type), size = 2.0, alpha = 0.8,
+           show.legend = TRUE) +
+    geom_text_repel(
+  data = df_labeled_all,
+  aes(label = gene, color = label_type),
+  size = 4.8, max.overlaps = 35,
+  #fontface = ifelse(df_labeled_all$is_immune, "bold", "bold.italic"),
+  bg.color = "white", bg.r = 0.15,
+  segment.size = 0.3,
+  box.padding = 0.4, point.padding = 0.25,
+  force = 3, seed = 42,
+  min.segment.length = 0.3
+) +
+# scale_color_manual(
+#   values = c("Immune" = IMMUNE_LABEL_COLOR, "Novel" = NOVEL_LABEL_COLOR),
+#   guide = "none"
+# )+
+   scale_color_manual(
+  name   = "Gene type",
+  values = c("Immune" = IMMUNE_LABEL_COLOR, "Novel" = NOVEL_LABEL_COLOR),
+  labels = c("Immune" = "known regulator", "Novel" = "newly identified regulator"),
+  guide  = guide_legend(
+    override.aes = list(
+      shape = 16, size = 4, alpha = 1,
+      label = "",          # suppress the "a"
+      label.size = 0
+    )
+  )
+)+
+    labs(
+      x = paste0(mx, ": ", mx_name),
+      y = paste0(my, ": ", my_name)
+    ) +
+
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.title.x = element_text(color = mx_color, face = "bold", size = 14),
+      axis.title.y = element_text(color = my_color, face = "bold", size = 14),
+      axis.text = element_text(size = 12, color = "grey30"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92", linewidth = 0.25),
+      plot.margin = margin(8, 8, 8, 8),
+      #legend.position      = "left",
+      legend.position      = c(0.02, 0.02),
+legend.justification = c(0, 0),
+legend.background    = element_rect(fill = "white", color = "grey80", linewidth = 0.3),
+legend.title         = element_text(size = 12, face = "bold"),
+legend.text          = element_text(size = 12),
+legend.key.size      = unit(0.4, "cm"),
+legend.margin        = margin(4, 6, 4, 6)
+    )
+
+  p
+}
+
+cat("\n=== Panel A: M1 vs M3 ===\n")
+pA <- plot_axis_scatter(
+  gene_df, "M1", "M3",
+  mx_name  = MODULE_NAMES["M1"],
+  my_name  = MODULE_NAMES["M3"],
+  mx_color = MODULE_COLORS["M1"],
+  my_color = MODULE_COLORS["M3"]
+)
+pA
+cat("Top-left outlier:\n")
+print(gene_df %>% filter(M1 < -0.08) %>% select(gene, M1, M3, is_non_tcell))
+
+ggsave(file.path(OUTPUT_DIR, "scatter_M1_vs_M3_phenotype_landscape.pdf"),
+       pA, width = 6.5, height = 6.5)
+# ggsave(file.path(OUTPUT_DIR, "scatter_M1_vs_M3_phenotype_landscape.png"),
+#        pA, width = 6.5, height = 6.5, dpi = 300)
+
+cat("\n=== Panel B: M2 vs M5 ===\n")
+pB <- plot_axis_scatter(
+  gene_df, "M2", "M5",
+  mx_name  = MODULE_NAMES["M2"],
+  my_name  = MODULE_NAMES["M5"],
+  mx_color = MODULE_COLORS["M2"],
+  my_color = MODULE_COLORS["M5"]
+) + theme(legend.position = "none")
+pB
+ggsave(file.path(OUTPUT_DIR, "scatter_M2_vs_M5_phenotype_landscape.pdf"),
+       pB, width = 6.5, height = 6.5)
+# ggsave(file.path(OUTPUT_DIR, "scatter_M2_vs_M5_phenotype_landscape.png"),
+#        pB, width = 6.5, height = 6.5, dpi = 300)
+
+
+pc <- plot_axis_scatter(
+  gene_df, "M4", "M5",
+  mx_name  = MODULE_NAMES["M4"],
+  my_name  = MODULE_NAMES["M5"],
+  mx_color = MODULE_COLORS["M4"],
+  my_color = MODULE_COLORS["M5"]
+) + theme(legend.position = "none")
+pc
+ggsave(file.path(OUTPUT_DIR, "scatter_M4_vs_M5_phenotype_landscape.pdf"),
+       pc, width = 6.5, height = 6.5)
+# ggsave(file.path(OUTPUT_DIR, "scatter_M2_vs_M5_phenotype_landscape.png"),
+#        pc, width = 6.5, height = 6.5, dpi = 300)
+
+
+# # ── Combined 2-panel ──
+# p_combined <- pA + pB + plot_layout(ncol = 2)
+# p_combined
+# ggsave(file.path(OUTPUT_DIR, "scatter_phenotype_landscape_combined.pdf"),
+#        p_combined, width = 12.5, height = 6)
+# ggsave(file.path(OUTPUT_DIR, "scatter_phenotype_landscape_combined.png"),
+#        p_combined, width = 12.5, height = 6, dpi = 300)
+@
+
+\end{document}

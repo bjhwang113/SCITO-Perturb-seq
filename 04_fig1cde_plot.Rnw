@@ -1,0 +1,408 @@
+\documentclass{article}
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+<<setup>>=
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(scales)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(RColorBrewer)
+  library(patchwork)
+  library(stringr)
+})
+
+set.seed(42)
+
+DATA_DIR    <- "/home/ec2-user/scitoseq/data"
+results_dir <- "/home/ec2-user/scitoseq/results/results_gene_level"
+sgrna_dir   <- "/home/ec2-user/scitoseq/results/results_sgrna_level"
+fig_dir     <- "/home/ec2-user/scitoseq/fig/fig1"
+
+theme_pub <- theme_bw(base_size = 16) + theme(
+  panel.grid.minor  = element_blank(),
+  strip.background  = element_rect(fill = "white"),
+  legend.background = element_rect(fill = "white", color = NA),
+  plot.title        = element_text(face = "bold", size = 14),
+  plot.subtitle     = element_text(size = 10, color = "gray30"))
+@
+
+<<load-data>>=
+gene_lfc_mat          <- readRDS(file.path(results_dir, "gene_lfc_mat.rds"))
+gene_se_mat           <- readRDS(file.path(results_dir, "gene_se_mat.rds"))
+gene_zscore_mat       <- readRDS(file.path(results_dir, "gene_zscore_mat.rds"))
+gene_pval_mat         <- readRDS(file.path(results_dir, "gene_pval_mat.rds"))
+gene_qval_mat         <- readRDS(file.path(results_dir, "gene_qval_per_protein.rds"))
+ncells_per_gene       <- readRDS(file.path(results_dir, "gene_ncells.rds"))
+self_targeted_gene    <- readRDS(file.path(results_dir, "self_targeted_gene.rds"))
+hits_df               <- readRDS(file.path(results_dir, "all_hits_df.rds"))
+gene_info             <- readRDS(file.path(results_dir, "gene_info.rds"))
+
+sgrna_lfc_mat  <- readRDS(file.path(sgrna_dir, "sgrna_lfc_mat.rds"))
+sgrna_info     <- readRDS(file.path(sgrna_dir, "sgrna_info.rds"))
+sgrna_zscore_mat <- readRDS(file.path(sgrna_dir, "sgrna_zscore_mat.rds"))
+@
+
+% ============================================================
+% SELF-TARGETED SCATTER PLOTS
+% ============================================================
+
+<<scatter-prep>>=
+self_targeted_gene$neg_log10_pval <- -log10(self_targeted_gene$pval)
+
+self_targeted_gene$significance <- case_when(
+  self_targeted_gene$qval < 0.10 ~ "FDR < 0.10",
+  TRUE ~ "Not significant")
+self_targeted_gene$significance <- factor(
+  self_targeted_gene$significance,
+  levels = c("Not significant", "FDR < 0.10"))
+
+table(self_targeted_gene$significance)
+@
+
+<<scatter-original>>=
+# ---- Original self_targeted_scatter (from 244_fig1_plot_cleaned.Rnw) --------
+top_hits <- self_targeted_gene %>%
+  arrange(desc(zscore)) %>%
+  filter(significance == "FDR < 0.10")
+
+fig_scatter <- ggplot(self_targeted_gene,
+    aes(x = lfc, y = neg_log10_pval, color = significance)) +
+  geom_point(size = 2.5, alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray50") +
+  ggrepel::geom_text_repel(
+    data = top_hits, aes(label = gene), size = 7,
+    color = "black", fontface = "bold", box.padding = 0.35,
+    point.padding = 0.25, max.overlaps = Inf,
+    seed = 1) +
+  scale_color_manual(values = c(
+    "Not significant" = "gray60", "FDR < 0.10" = "firebrick")) +
+  labs(
+    title = sprintf("Self-Targeted Gene-Protein Pairs (n = %d)", nrow(self_targeted_gene)),
+    x = "Normalized Expression Difference (vs. NTC)",
+    y = "-log10(p-value)",
+    color = "Significance") +
+  xlim(-0.5, 5.5) +
+  theme_pub +
+  theme(
+    legend.position = c(0.85, 0.15),
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.key = element_rect(fill = "white", color = NA),
+    legend.margin = margin(4, 6, 4, 6))
+
+fig_scatter
+ggsave(file.path(fig_dir, "self_targeted_scatter.pdf"), fig_scatter, width = 14, height = 8)
+@
+
+<<scatter-vA>>=
+# ---- Version A: wide, all sig. labels, publication quality ------------------
+n_sig    <- sum(self_targeted_gene$significance == "FDR < 0.10")
+n_total  <- nrow(self_targeted_gene)
+fdr_line <- -log10(max(self_targeted_gene$pval[self_targeted_gene$qval < 0.10],
+                       na.rm = TRUE))
+
+COL_NS  <- "gray82"
+COL_SIG <- "#C0392B"
+
+base_theme <- theme_bw(base_size = 15) +
+  theme(
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    strip.background   = element_rect(fill = "white"),
+    axis.title         = element_text(size = 14),
+    axis.text          = element_text(size = 14),
+    legend.text        = element_text(size = 14),
+    legend.title       = element_text(size = 14),
+    plot.title         = element_blank()
+  )
+
+leg_theme <- theme(
+  legend.position   = c(0.8, 0.12),
+  legend.background = element_rect(fill = "white", color = "grey70", linewidth = 0.4),
+  legend.key        = element_rect(fill = "white", color = NA),
+  legend.margin     = margin(3, 6, 3, 6))
+
+sig_labels_all <- self_targeted_gene %>% filter(significance == "FDR < 0.10")
+
+scatter_vA <- ggplot(self_targeted_gene,
+    aes(x = lfc, y = neg_log10_pval, color = significance)) +
+  geom_point(
+    data = ~ filter(.x, significance == "Not significant"),
+    size = 1.8, alpha = 0.45) +
+  geom_point(
+    data = ~ filter(.x, significance == "FDR < 0.10"),
+    size = 2.5, alpha = 0.9) +
+  geom_hline(yintercept = fdr_line, linetype = "dashed",
+             color = "grey45", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dotted",
+             color = "grey45", linewidth = 0.4) +
+  geom_text_repel(
+    data = sig_labels_all,
+    aes(label = gene), size = 5.0, color = "black",
+    box.padding = 0.4, point.padding = 0.2,
+    max.overlaps = Inf, seed = 42, segment.size = 0.3,
+    segment.color = "grey50") +
+  scale_color_manual(
+    values = c("Not significant" = COL_NS, "FDR < 0.10" = COL_SIG),
+    labels = c(
+      sprintf("Not significant (n = %d)", n_total - n_sig),
+      sprintf("FDR < 0.10 (n = %d)", n_sig))) +
+  labs(
+    x     = "Normalized Expression Difference (vs. NTC)",
+    y     = expression(-log[10](italic(p))),
+    color = NULL) +
+  xlim(-0.5, 5.5) +
+  base_theme + leg_theme
+
+scatter_vA
+ggsave(file.path(fig_dir, "scatter_vA_wide_alllabels.pdf"),
+       scatter_vA, width = 11, height = 6.5)
+@
+
+<<scatter-vB>>=
+# ---- Version B: compact, top-25 labels only ---------------------------------
+sig_labels_top <- sig_labels_all %>% arrange(desc(zscore)) %>% head(25)
+
+scatter_vB <- ggplot(self_targeted_gene,
+    aes(x = lfc, y = neg_log10_pval, color = significance)) +
+  geom_point(
+    data = ~ filter(.x, significance == "Not significant"),
+    size = 1.5, alpha = 0.40) +
+  geom_point(
+    data = ~ filter(.x, significance == "FDR < 0.10"),
+    size = 2.2, alpha = 0.9) +
+  geom_hline(yintercept = fdr_line, linetype = "dashed",
+             color = "grey45", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dotted",
+             color = "grey45", linewidth = 0.4) +
+  geom_text_repel(
+    data = sig_labels_top,
+    aes(label = gene), size = 5.0, color = "black",
+    box.padding = 0.45, point.padding = 0.25,
+    max.overlaps = Inf, seed = 42, segment.size = 0.3,
+    segment.color = "grey50") +
+  scale_color_manual(
+    values = c("Not significant" = COL_NS, "FDR < 0.10" = COL_SIG),
+    labels = c(
+      sprintf("Not significant (n = %d)", n_total - n_sig),
+      sprintf("FDR < 0.10 (n = %d)", n_sig))) +
+  labs(
+    x     = "Normalized Expression Difference (vs. NTC)",
+    y     = expression(-log[10](italic(p))),
+    color = NULL) +
+  xlim(-0.5, 5.5) +
+  base_theme + leg_theme
+
+scatter_vB
+ggsave(file.path(fig_dir, "scatter_vB_compact_top25.pdf"),
+       scatter_vB, width = 7, height = 6)
+@
+
+% ============================================================
+% SELF-TARGETED HEATMAP (RdBu, no highlight) -- from 265.Rnw
+% ============================================================
+
+<<heatmap-build>>=
+# Gene-centric dedup: one protein per gene (strongest |zscore|)
+self_v1 <- self_targeted_gene %>%
+  group_by(gene) %>%
+  slice_max(order_by = abs(zscore), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  group_by(protein) %>%
+  slice_max(order_by = abs(zscore), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(gene)
+
+n_pairs       <- nrow(self_v1)
+genes_orig    <- self_v1$gene
+proteins_orig <- self_v1$protein
+
+heatmap_lfc <- matrix(NA,
+  nrow = n_pairs, ncol = n_pairs,
+  dimnames = list(genes_orig, proteins_orig))
+
+for (i in seq_len(n_pairs)) {
+  heatmap_lfc[i, i] <- self_v1$lfc[i]
+}
+
+for (i in seq_len(n_pairs)) {
+  g <- genes_orig[i]
+  if (!g %in% rownames(gene_lfc_mat)) next
+  for (j in seq_len(n_pairs)) {
+    if (!is.na(heatmap_lfc[i, j])) next
+    p <- proteins_orig[j]
+    if (!p %in% colnames(gene_lfc_mat)) next
+    heatmap_lfc[i, j] <- gene_lfc_mat[g, p]
+  }
+}
+
+cat(sprintf("NA entries remaining: %d (should be ~0)\n", sum(is.na(heatmap_lfc))))
+
+protein_labels <- proteins_orig
+protein_labels <- gsub("CD57Recombinant", "CD57",   protein_labels)
+protein_labels <- gsub("anti-CD230-Prion", "CD230", protein_labels)
+protein_labels[proteins_orig == "MICA-MICB"] <- "MICA"
+gene_labels <- genes_orig
+@
+
+<<heatmap-RdBu-nohighlight>>=
+# ---- self_heatmap_RdBu_nohighlight.pdf (from 265.Rnw) ----------------------
+suppressPackageStartupMessages({
+  library(ComplexHeatmap)
+  library(circlize)
+  library(RColorBrewer)
+})
+
+alpha_gene <- order(gene_labels)
+mat_A      <- heatmap_lfc[alpha_gene, alpha_gene]
+
+brks    <- seq(-2, 2, length.out = 101)
+col_fun <- colorRamp2(brks[-1], rev(colorRampPalette(brewer.pal(11, "RdBu"))(100)))
+
+ht_opt$message <- FALSE
+
+lgd_params <- list(
+  title          = "Normalized expression difference (vs. NTC)",
+  title_position = "topcenter",
+  direction      = "horizontal",
+  legend_width   = unit(4.5, "cm"),
+  title_gp       = gpar(fontsize = 7, fontface = "plain"),
+  labels_gp      = gpar(fontsize = 6))
+
+axis_gp <- gpar(fontsize = 8)
+
+ht <- Heatmap(
+  mat_A,
+  col               = col_fun,
+  na_col            = "gray90",
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  show_row_names    = FALSE,
+  show_column_names = FALSE,
+  row_title         = "Perturbed gene",
+  row_title_gp      = axis_gp,
+  row_title_side    = "left",
+  column_title      = "Protein measured",
+  column_title_gp   = axis_gp,
+  column_title_side = "bottom",
+  heatmap_legend_param = lgd_params,
+  layer_fun         = NULL,
+  border            = FALSE,
+  use_raster        = TRUE,
+  raster_quality    = 5,
+  width             = unit(2.8, "in"),
+  height            = unit(2.8, "in"))
+
+pdf(file.path(fig_dir, "self_heatmap_RdBu_nohighlight.pdf"), width = 3.5, height = 4.2)
+draw(ht, heatmap_legend_side = "bottom")
+dev.off()
+cat("Saved: self_heatmap_RdBu_nohighlight.pdf\n")
+@
+
+% ============================================================
+% SGRNA PAIR SCATTER (self-targeted) -- from 265.Rnw
+% ============================================================
+
+<<pair-scatter-data>>=
+genes_2sg <- gene_info %>% filter(n_sgrnas == 2) %>% pull(gene)
+self_2sg  <- self_targeted_gene %>% filter(gene %in% genes_2sg)
+
+pair_list <- list()
+
+for (i in seq_len(nrow(self_2sg))) {
+  gene <- self_2sg$gene[i]
+  prot <- self_2sg$protein[i]
+
+  sg_pair <- sgrna_info %>%
+    filter(gene == !!gene) %>%
+    arrange(sgRNA) %>%
+    pull(sgRNA)
+
+  if (length(sg_pair) != 2) next
+  sg1 <- sg_pair[1]; sg2 <- sg_pair[2]
+  if (!all(c(sg1, sg2) %in% rownames(sgrna_lfc_mat))) next
+  if (!prot %in% colnames(sgrna_lfc_mat)) next
+
+  pair_list[[paste(gene, prot)]] <- data.frame(
+    gene    = gene,
+    protein = prot,
+    lfc_sg1 = sgrna_lfc_mat[sg1, prot],
+    lfc_sg2 = sgrna_lfc_mat[sg2, prot],
+    stringsAsFactors = FALSE)
+}
+
+pair_df    <- bind_rows(pair_list)
+both_pos   <- mean(pair_df$lfc_sg1 > 0 & pair_df$lfc_sg2 > 0, na.rm = TRUE)
+rho_pair   <- cor(pair_df$lfc_sg1, pair_df$lfc_sg2, method = "spearman", use = "complete.obs")
+cat(sprintf("Self-targeted genes with 2 evaluable sgRNAs: %d\n", nrow(pair_df)))
+cat(sprintf("Both sgRNAs positive: %.1f%%\n", 100 * both_pos))
+cat(sprintf("Spearman rho (target protein only): %.3f\n", rho_pair))
+@
+
+<<pair-scatter-plot>>=
+# ---- sgrna_pair_scatter_self_targeted.pdf (from 265.Rnw) --------------------
+q_counts <- pair_df %>%
+  summarise(
+    pp = sum(lfc_sg1 > 0 & lfc_sg2 > 0),
+    pn = sum(lfc_sg1 > 0 & lfc_sg2 <= 0),
+    np = sum(lfc_sg1 <= 0 & lfc_sg2 > 0),
+    nn = sum(lfc_sg1 <= 0 & lfc_sg2 <= 0))
+
+top_label <- pair_df %>%
+  mutate(mean_lfc = (lfc_sg1 + lfc_sg2) / 2) %>%
+  arrange(desc(mean_lfc)) %>%
+  slice_head(n = 7)
+
+stats_label <- sprintf("n = %d \nSpearman rho = %.2f", nrow(pair_df), rho_pair)
+
+fig_pair <- ggplot(pair_df, aes(x = lfc_sg1, y = lfc_sg2)) +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = 0, ymax = Inf,
+           fill = "#fee8e8", alpha = 0.4) +
+  geom_hline(yintercept = 0, color = "gray50", linetype = "dotted", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "gray50", linetype = "dotted", linewidth = 0.4) +
+  geom_abline(slope = 1, intercept = 0, color = "gray30", linetype = "dashed", linewidth = 0.4) +
+  geom_point(size = 1.4, alpha = 0.7, color = "firebrick") +
+  geom_text_repel(data = top_label,
+    aes(label = gene),
+    size = 2.8, color = "black", box.padding = 0.4,
+    point.padding = 0.2, max.overlaps = 20, seed = 1,
+    segment.color = "gray60", segment.size = 0.3,
+    min.segment.length = 0.2) +
+  annotate("text", x = -Inf, y =  Inf, hjust = -0.1, vjust = 1.5,
+    label = sprintf("n = %d", q_counts$np), size = 2.8, color = "gray50") +
+  annotate("text", x =  Inf, y =  Inf, hjust = 2,#1.6, 
+           vjust = 1.5,
+    label = sprintf("n = %d (%.0f%%)", q_counts$pp, 100 * both_pos),
+    size = 2.8, color = "firebrick", fontface = "bold") +
+  annotate("text", x = -Inf, y = -Inf, hjust = -0.1, vjust = -0.5,
+    label = sprintf("n = %d", q_counts$nn), size = 2.8, color = "gray50") +
+  annotate("text", x =  Inf, y = -Inf, hjust = 1.05, vjust = -0.5,
+    label = sprintf("n = %d", q_counts$pn), size = 2.8, color = "gray50") +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.05, vjust = -1.2,
+    label = stats_label, size = 2.8,
+    color = "gray30", lineheight = 1.3) +
+  labs(
+    x = "sgRNA 1 expression difference (vs. NTC)",
+    y = "sgRNA 2 expression difference (vs. NTC)") +
+  coord_fixed() +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid.minor  = element_blank(),
+    panel.grid.major  = element_line(color = "gray92", linewidth = 0.3),
+    axis.title        = element_text(size = 9),
+    axis.text         = element_text(size = 8),
+    plot.margin       = margin(5, 8, 5, 5))
+
+print(fig_pair)
+ggsave(file.path(fig_dir, "sgrna_pair_scatter_self_targeted.pdf"),
+       fig_pair, width = 3.3, height = 3.3)
+cat("Saved: sgrna_pair_scatter_self_targeted.pdf\n")
+@
+
+\end{document}

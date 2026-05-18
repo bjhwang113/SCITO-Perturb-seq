@@ -1,0 +1,1246 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+<<>>=
+suppressPackageStartupMessages({
+  library(grid)
+  library(dplyr)
+  library(tidyr)
+  library(Matrix)
+  library(dbscan)
+  library(ggrepel)
+  library(ggplot2)
+  library(cluster)
+  library(msigdbr)
+  library(circlize)
+  library(enrichplot)
+  library(org.Hs.eg.db)
+  library(RColorBrewer)
+  library(ComplexHeatmap)
+  library(clusterProfiler)
+})
+
+set.seed(42)
+
+# --- GENE FILTERING ---
+MIN_SIG_PROTEINS <- 3 #1
+SIG_FDR_THRESHOLD <- 0.10
+USE_LFC_FILTER <- FALSE # TRUE #
+LFC_THRESHOLD <- 0.5
+
+# --- CLUSTERING ---
+USE_HIERARCHICAL <- TRUE
+N_CLUSTERS <- 10
+HDBSCAN_MIN_PTS <- 3
+MIN_CLUSTER_SIZE <- 3
+
+# --- ENRICHMENT ---
+USE_ALL_GENES_AS_BACKGROUND <- TRUE
+MAX_PATHWAY_SIZE <- 200
+MIN_PATHWAY_SIZE <- 5
+MIN_OVERLAP <- 2
+ENRICHMENT_QVAL_CUTOFF <- 0.25
+
+# --- DIRECTORIES ---
+DATA_DIR <- "/home/ec2-user/scitoseq/data"
+GENE_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+CORR_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_correlation"
+
+cat("PARAMETERS:\n")
+cat(sprintf("  GENE FILTER: ≥%d significant proteins\n", MIN_SIG_PROTEINS))
+cat(sprintf("  USE_LFC_FILTER: %s\n", USE_LFC_FILTER))
+cat(sprintf("  CLUSTERING: %s (k=%d)\n", 
+            ifelse(USE_HIERARCHICAL, "Hierarchical", "HDBSCAN"), N_CLUSTERS))
+
+# SECTION 1: LOAD DATA
+gene_zscore_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_zscore_mat.rds"))
+gene_lfc_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_lfc_mat.rds"))
+gene_ncells <- readRDS(file.path(GENE_RESULTS_DIR, "gene_ncells.rds"))
+gene_qval_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_qval_per_protein.rds"))
+
+cat(sprintf("Gene Z-score matrix: %d genes × %d proteins\n",
+            nrow(gene_zscore_mat), ncol(gene_zscore_mat)))
+
+self_targeted_gene <- readRDS(file.path(GENE_RESULTS_DIR, "self_targeted_gene.rds"))
+prot_cluster_df <- readRDS(file.path(CORR_RESULTS_DIR, "protein_clusters.rds"))
+proteins_ordered <- readRDS(file.path(CORR_RESULTS_DIR, "protein_order_ntc.rds"))
+
+protein_to_cluster <- setNames(prot_cluster_df$cluster_name, prot_cluster_df$protein)
+protein_groups <- unique(prot_cluster_df$cluster_name)
+
+# SECTION 2: FILTER GENES
+sig_pairs_fdr <- gene_qval_mat < SIG_FDR_THRESHOLD
+
+if (USE_LFC_FILTER) {
+  sig_pairs_lfc <- abs(gene_lfc_mat) > LFC_THRESHOLD
+  sig_pairs <- sig_pairs_fdr & sig_pairs_lfc
+  cat(sprintf("Criteria: FDR < %.2f AND |LFC| > %.2f\n", SIG_FDR_THRESHOLD, LFC_THRESHOLD))
+} else {
+  sig_pairs <- sig_pairs_fdr
+  cat(sprintf("Criteria: FDR < %.2f (no LFC filter)\n", SIG_FDR_THRESHOLD))
+}
+
+n_sig_proteins_per_gene <- rowSums(sig_pairs, na.rm = TRUE)
+
+cat("\nDistribution of significant proteins per gene:\n")
+print(table(n_sig_proteins_per_gene[n_sig_proteins_per_gene > 0]))
+
+genes_filtered <- names(n_sig_proteins_per_gene)[n_sig_proteins_per_gene >= MIN_SIG_PROTEINS]
+n_genes_filtered <- length(genes_filtered)
+
+cat(sprintf("\n*** SELECTED: %d genes with ≥%d significant proteins ***\n", 
+            n_genes_filtered, MIN_SIG_PROTEINS))
+# *** SELECTED: 299 genes with ≥3 significant proteins ***
+
+# SECTION 3: CREATE MASKED Z-SCORE MATRIX
+gene_zscore_masked <- gene_zscore_mat
+n_masked <- 0
+
+for (i in 1:nrow(self_targeted_gene)) {
+  gene <- self_targeted_gene$gene[i]
+  protein <- self_targeted_gene$protein[i]
+  if (gene %in% rownames(gene_zscore_masked) && protein %in% colnames(gene_zscore_masked)) {
+    gene_zscore_masked[gene, protein] <- NA
+    n_masked <- n_masked + 1
+  }
+}
+
+cat(sprintf("Masked %d on-target pairs\n", n_masked))
+
+zscore_for_clust <- gene_zscore_masked[genes_filtered, , drop = FALSE]
+zscore_for_clust_complete <- zscore_for_clust
+zscore_for_clust_complete[is.na(zscore_for_clust_complete)] <- 0
+zscore_for_clust_complete[!is.finite(zscore_for_clust_complete)] <- 0
+
+cat(sprintf("Clustering input: %d genes × %d proteins\n",
+            nrow(zscore_for_clust_complete), ncol(zscore_for_clust_complete)))
+
+# SECTION 4: CLUSTERING
+cat("Computing gene-gene correlation matrix...\n")
+corr_mat <- cor(t(zscore_for_clust_complete), method = "pearson", use = "pairwise.complete.obs")
+corr_mat[is.na(corr_mat)] <- 0
+
+cat(sprintf("Correlation range: [%.3f, %.3f]\n",
+            min(corr_mat[lower.tri(corr_mat)]),
+            max(corr_mat[lower.tri(corr_mat)])))
+
+corr_dist <- as.dist(1 - corr_mat)
+
+if (USE_HIERARCHICAL) {
+  cat("\nUsing Hierarchical Clustering (Ward.D2)...\n")
+  
+  hc <- hclust(corr_dist, method = "ward.D2")
+  
+  cat("Finding optimal k by silhouette...\n")
+  sil_scores <- sapply(5:min(20, n_genes_filtered - 1), function(k) {
+    clusters_k <- cutree(hc, k = k)
+    sil <- silhouette(clusters_k, corr_dist)
+    mean(sil[, 3])
+  })
+  
+  optimal_k <- (5:min(20, n_genes_filtered - 1))[which.max(sil_scores)]
+  cat(sprintf("Optimal k by silhouette: %d (score: %.3f)\n", optimal_k, max(sil_scores)))
+  
+  k_to_use <- N_CLUSTERS
+  gene_clusters <- cutree(hc, k = k_to_use)
+  names(gene_clusters) <- rownames(zscore_for_clust_complete)
+  
+  n_clusters <- k_to_use
+  cat(sprintf("\nUsing k = %d clusters\n", k_to_use))
+  
+} else {
+  cat(sprintf("\nUsing HDBSCAN (minPts = %d)...\n", HDBSCAN_MIN_PTS))
+  
+  hdbscan_result <- hdbscan(corr_dist, minPts = HDBSCAN_MIN_PTS)
+  gene_clusters <- hdbscan_result$cluster
+  names(gene_clusters) <- rownames(zscore_for_clust_complete)
+  
+  n_clusters <- length(unique(gene_clusters[gene_clusters > 0]))
+  n_noise <- sum(gene_clusters == 0)
+  
+  cat(sprintf("Clusters: %d, Noise: %d (%.1f%%)\n", 
+              n_clusters, n_noise, 100 * n_noise / length(gene_clusters)))
+}
+
+cat("\nCluster sizes:\n")
+print(table(gene_clusters))
+class(gene_clusters)
+
+# SECTION 5: GENE CLUSTER DATAFRAME
+gene_cluster_df <- data.frame(
+  gene = names(gene_clusters),
+  cluster = gene_clusters,
+  n_sig_proteins = n_sig_proteins_per_gene[names(gene_clusters)],
+  n_cells = gene_ncells[names(gene_clusters)],
+  stringsAsFactors = FALSE
+)
+cat("Computing intra-cluster correlations...\n")
+gene_cluster_df$mean_intra_corr <- NA_real_
+
+for (cl in unique(gene_cluster_df$cluster)) {
+  if (cl == 0) next
+  cluster_genes <- gene_cluster_df$gene[gene_cluster_df$cluster == cl]
+  if (length(cluster_genes) < 2) next
+  
+  cluster_corr_submat <- corr_mat[cluster_genes, cluster_genes]
+  mean_corr <- mean(cluster_corr_submat[lower.tri(cluster_corr_submat)], na.rm = TRUE)
+  gene_cluster_df$mean_intra_corr[gene_cluster_df$cluster == cl] <- mean_corr
+}
+#write.csv(gene_cluster_df, "/home/ec2-user/scitoseq/results/gene_clustering_df.csv")
+
+cat(sprintf("Genes in clusters: %d\n", sum(gene_cluster_df$cluster > 0)))
+
+cluster_intra_corr <- gene_cluster_df %>%
+  dplyr::filter(cluster > 0) %>%
+  group_by(cluster) %>%
+  summarise(intra_corr = dplyr::first(mean_intra_corr), .groups = "drop") %>%
+  tibble::deframe()
+
+cat("\nIntra-cluster correlations:\n")
+print(round(cluster_intra_corr, 3))
+#     1     2     3     4     5     6     7     8     9    10 
+# 0.305 0.193 0.313 0.102 0.310 0.335 0.329 0.359 0.307 0.257 
+@
+
+<<>>=
+# SECTION 6: CLUSTER CHARACTERIZATION
+cluster_protein_group_stats <- data.frame()
+
+for (clust in sort(unique(gene_clusters[gene_clusters > 0]))) {
+  cluster_genes <- names(gene_clusters)[gene_clusters == clust]
+  cluster_zscore <- zscore_for_clust[cluster_genes, , drop = FALSE]
+  
+  for (grp in protein_groups) {
+    group_proteins <- prot_cluster_df$protein[prot_cluster_df$cluster_name == grp]
+    group_proteins <- intersect(group_proteins, colnames(cluster_zscore))
+    
+    if (length(group_proteins) == 0) {
+      mean_abs <- NA
+      mean_signed <- NA
+    } else {
+      mean_abs <- mean(abs(cluster_zscore[, group_proteins, drop = FALSE]), na.rm = TRUE)
+      mean_signed <- mean(cluster_zscore[, group_proteins, drop = FALSE], na.rm = TRUE)
+    }
+    
+    cluster_protein_group_stats <- rbind(cluster_protein_group_stats, data.frame(
+      cluster = clust,
+      n_genes = length(cluster_genes),
+      protein_group = grp,
+      mean_abs_zscore = mean_abs,
+      mean_signed_zscore = mean_signed,
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+cluster_characterization <- cluster_protein_group_stats %>%
+  group_by(cluster, n_genes) %>%
+  summarise(
+    mean_effect = round(mean(mean_abs_zscore, na.rm = TRUE), 3),
+    dominant_group = protein_group[which.max(mean_abs_zscore)],
+    dominant_group_zscore = round(max(mean_abs_zscore, na.rm = TRUE), 3),
+    dominant_direction = ifelse(mean_signed_zscore[which.max(mean_abs_zscore)] > 0, "↑", "↓"),
+    .groups = "drop"
+  ) %>%
+  mutate(intra_cluster_corr = round(cluster_intra_corr[as.character(cluster)], 3))
+
+cat("Cluster Characterization:\n")
+print(as.data.frame(cluster_characterization))
+
+# SECTION 7: LOAD PATHWAY DATABASES
+# Convert gene symbols to Entrez IDs
+cat("Converting gene symbols to Entrez IDs...\n")
+all_genes <- rownames(gene_zscore_mat)
+gene_to_entrez <- bitr(all_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+cat(sprintf("Mapped %d / %d genes (%.1f%%)\n",
+            nrow(gene_to_entrez), length(all_genes),
+            100 * nrow(gene_to_entrez) / length(all_genes)))
+
+entrez_lookup <- setNames(gene_to_entrez$ENTREZID, gene_to_entrez$SYMBOL)
+
+cat(sprintf("\nmsigdbr version: %s\n", packageVersion("msigdbr")))
+
+# FIXED: msigdbr v25 uses 'ncbi_gene' instead of 'entrez_gene'
+load_msigdb_v25 <- function(gs_collection, gs_subcollection = NULL, 
+                            min_size = MIN_PATHWAY_SIZE, 
+                            max_size = MAX_PATHWAY_SIZE) {
+  tryCatch({
+    if (is.null(gs_subcollection) || gs_subcollection == "") {
+      df <- msigdbr(species = "Homo sapiens", collection = gs_collection)
+    } else {
+      df <- msigdbr(species = "Homo sapiens", collection = gs_collection, 
+                    subcollection = gs_subcollection)
+    }
+    
+    if (nrow(df) == 0) {
+      return(list(term2gene = data.frame(), term2name = data.frame(), n_pathways = 0))
+    }
+    
+    name_col <- "gs_name"
+    entrez_col <- "ncbi_gene"
+    
+    if (!all(c(name_col, entrez_col, "gene_symbol") %in% colnames(df))) {
+      cat(sprintf("  Missing required columns in %s\n", gs_collection))
+      return(list(term2gene = data.frame(), term2name = data.frame(), n_pathways = 0))
+    }
+    
+    pathway_sizes <- df %>%
+      group_by(.data[[name_col]]) %>%
+      summarise(n = n_distinct(gene_symbol), .groups = "drop") %>%
+      dplyr::filter(n >= min_size, n <= max_size)
+    
+    df_filtered <- df %>%
+      dplyr::filter(.data[[name_col]] %in% pathway_sizes[[name_col]]) %>%
+      dplyr::select(all_of(c(name_col, "gene_symbol", entrez_col))) %>%
+      distinct()
+    
+    term2gene <- df_filtered %>%
+      dplyr::select(term = all_of(name_col), gene = all_of(entrez_col)) %>%
+      mutate(gene = as.character(gene)) %>%
+      dplyr::filter(!is.na(gene))
+    
+    term2name <- df_filtered %>%
+      dplyr::select(all_of(name_col)) %>%
+      distinct() %>%
+      mutate(name = .data[[name_col]]) %>%
+      dplyr::rename(term = all_of(name_col))
+    
+    list(
+      term2gene = term2gene,
+      term2name = term2name,
+      n_pathways = length(unique(term2gene$term))
+    )
+  }, error = function(e) {
+    cat(sprintf("  Warning: Could not load %s/%s: %s\n", 
+                gs_collection, 
+                ifelse(is.null(gs_subcollection), "", gs_subcollection), 
+                conditionMessage(e)))
+    list(term2gene = data.frame(), term2name = data.frame(), n_pathways = 0)
+  })
+}
+
+cat("\nLoading MSigDB pathway databases...\n")
+
+hallmark_data <- load_msigdb_v25("H", min_size = 1, max_size = 500)
+cat(sprintf("  Hallmark: %d gene sets\n", hallmark_data$n_pathways))
+
+kegg_data <- load_msigdb_v25("C2", "CP:KEGG_MEDICUS")
+if (kegg_data$n_pathways == 0) {
+  kegg_data <- load_msigdb_v25("C2", "CP:KEGG_LEGACY")
+}
+cat(sprintf("  KEGG (MSigDB): %d pathways\n", kegg_data$n_pathways))
+
+reactome_data <- load_msigdb_v25("C2", "CP:REACTOME")
+cat(sprintf("  Reactome: %d pathways\n", reactome_data$n_pathways))
+
+gobp_data <- load_msigdb_v25("C5", "GO:BP")
+cat(sprintf("  GO BP (MSigDB): %d pathways\n", gobp_data$n_pathways))
+
+# --- Load CORUM ---
+cat("\nLoading CORUM protein complexes...\n")
+
+corum_file <- file.path(DATA_DIR, "corum_humanComplexes.txt")
+if (file.exists(corum_file)) {
+  corum_df <- read.delim(corum_file, stringsAsFactors = FALSE)
+  cat(sprintf("  CORUM file: %d rows\n", nrow(corum_df)))
+  
+  corum_list <- list()
+  for (i in 1:nrow(corum_df)) {
+    complex_name <- corum_df$complex_name[i]
+    subunits_str <- corum_df$subunits_gene_name[i]
+    
+    if (is.na(subunits_str) || subunits_str == "") next
+    
+    subunits <- strsplit(subunits_str, ";")[[1]]
+    subunits <- trimws(subunits)
+    subunits <- subunits[subunits != "" & !is.na(subunits)]
+    
+    if (length(subunits) >= MIN_PATHWAY_SIZE && length(subunits) <= MAX_PATHWAY_SIZE) {
+      corum_list[[complex_name]] <- subunits
+    }
+  }
+  
+  cat(sprintf("  Complexes after size filter: %d\n", length(corum_list)))
+  
+  if (length(corum_list) > 0) {
+    corum_term2gene <- do.call(rbind, lapply(names(corum_list), function(term) {
+      genes <- corum_list[[term]]
+      entrez_ids <- entrez_lookup[genes]
+      entrez_ids <- entrez_ids[!is.na(entrez_ids)]
+      if (length(entrez_ids) >= MIN_PATHWAY_SIZE) {
+        data.frame(term = term, gene = as.character(entrez_ids), stringsAsFactors = FALSE)
+      } else {
+        NULL
+      }
+    }))
+    
+    if (!is.null(corum_term2gene) && nrow(corum_term2gene) > 0) {
+      corum_data <- list(
+        term2gene = corum_term2gene,
+        term2name = data.frame(term = unique(corum_term2gene$term), 
+                               name = unique(corum_term2gene$term),
+                               stringsAsFactors = FALSE),
+        n_pathways = length(unique(corum_term2gene$term))
+      )
+      cat(sprintf("  CORUM: %d complexes ready\n", corum_data$n_pathways))
+    } else {
+      corum_data <- list(term2gene = data.frame(), term2name = data.frame(), n_pathways = 0)
+    }
+  } else {
+    corum_data <- list(term2gene = data.frame(), term2name = data.frame(), n_pathways = 0)
+  }
+} else {
+  corum_data <- list(term2gene = data.frame(), term2name = data.frame(), n_pathways = 0)
+  cat(sprintf("  CORUM: File not found at %s\n", corum_file))
+}
+
+# SECTION 8: ORA ENRICHMENT ANALYSIS
+background_genes <- rownames(gene_zscore_mat)
+background_entrez <- unique(gene_to_entrez$ENTREZID[gene_to_entrez$SYMBOL %in% background_genes])
+
+cat(sprintf("Background: %d genes (%d with Entrez IDs)\n", 
+            length(background_genes), length(background_entrez)))
+
+STANDARD_COLS <- c("ID", "Description", "GeneRatio", "BgRatio", "RichFactor", 
+                   "FoldEnrichment", "zScore", "pvalue", "p.adjust", "qvalue", 
+                   "geneID", "Count", "overlap_size", "database")
+
+standardize_enrichment_df <- function(df, db_name) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  
+  df$database <- db_name
+  
+  for (col in STANDARD_COLS) {
+    if (!col %in% colnames(df)) {
+      df[[col]] <- NA
+    }
+  }
+  
+  return(df[, STANDARD_COLS, drop = FALSE])
+}
+
+run_enrichment <- function(cluster_genes, background_entrez, term2gene, term2name, 
+                           db_name, min_overlap = MIN_OVERLAP) {
+  
+  cluster_entrez <- unique(gene_to_entrez$ENTREZID[gene_to_entrez$SYMBOL %in% cluster_genes])
+  
+  if (length(cluster_entrez) < min_overlap) return(NULL)
+  if (nrow(term2gene) == 0) return(NULL)
+  
+  result <- tryCatch({
+    enricher(
+      gene = cluster_entrez,
+      universe = background_entrez,
+      TERM2GENE = term2gene,
+      TERM2NAME = term2name,
+      pvalueCutoff = 1,
+      qvalueCutoff = 1,
+      minGSSize = MIN_PATHWAY_SIZE,
+      maxGSSize = MAX_PATHWAY_SIZE
+    )
+  }, error = function(e) NULL)
+  
+  if (is.null(result) || nrow(result@result) == 0) return(NULL)
+  
+  result_df <- result@result
+  result_df$overlap_size <- sapply(strsplit(result_df$GeneRatio, "/"), function(x) as.numeric(x[1]))
+  result_df <- result_df[result_df$overlap_size >= min_overlap, ]
+  
+  if (nrow(result_df) == 0) return(NULL)
+  
+  return(standardize_enrichment_df(result_df, db_name))
+}
+
+run_enrichGO_builtin <- function(cluster_genes, background_entrez) {
+  cluster_entrez <- unique(gene_to_entrez$ENTREZID[gene_to_entrez$SYMBOL %in% cluster_genes])
+  if (length(cluster_entrez) < MIN_OVERLAP) return(NULL)
+  
+  tryCatch({
+    res <- enrichGO(
+      gene = cluster_entrez,
+      universe = background_entrez,
+      OrgDb = org.Hs.eg.db,
+      ont = "BP",
+      pvalueCutoff = 1,
+      qvalueCutoff = 1,
+      minGSSize = MIN_PATHWAY_SIZE,
+      maxGSSize = MAX_PATHWAY_SIZE,
+      readable = TRUE
+    )
+    if (!is.null(res) && nrow(res@result) > 0) {
+      df <- res@result
+      df$overlap_size <- sapply(strsplit(df$GeneRatio, "/"), function(x) as.numeric(x[1]))
+      df <- df[df$overlap_size >= MIN_OVERLAP, ]
+      if (nrow(df) > 0) {
+        return(standardize_enrichment_df(df, "GO_BP"))
+      }
+    }
+    return(NULL)
+  }, error = function(e) NULL)
+}
+
+run_enrichKEGG_builtin <- function(cluster_genes, background_entrez) {
+  cluster_entrez <- unique(gene_to_entrez$ENTREZID[gene_to_entrez$SYMBOL %in% cluster_genes])
+  if (length(cluster_entrez) < MIN_OVERLAP) return(NULL)
+  
+  tryCatch({
+    res <- enrichKEGG(
+      gene = cluster_entrez,
+      universe = background_entrez,
+      organism = "hsa",
+      pvalueCutoff = 1,
+      qvalueCutoff = 1,
+      minGSSize = MIN_PATHWAY_SIZE,
+      maxGSSize = MAX_PATHWAY_SIZE
+    )
+    if (!is.null(res) && nrow(res@result) > 0) {
+      df <- res@result
+      df$overlap_size <- sapply(strsplit(df$GeneRatio, "/"), function(x) as.numeric(x[1]))
+      df <- df[df$overlap_size >= MIN_OVERLAP, ]
+      if (nrow(df) > 0) {
+        return(standardize_enrichment_df(df, "KEGG"))
+      }
+    }
+    return(NULL)
+  }, error = function(e) NULL)
+}
+
+# Run enrichment for each cluster
+ora_results_all <- list()
+ora_summary <- data.frame()
+
+for (clust in sort(unique(gene_clusters[gene_clusters > 0]))) {
+  cluster_genes <- names(gene_clusters)[gene_clusters == clust]
+  
+  if (length(cluster_genes) < MIN_CLUSTER_SIZE) {
+    cat(sprintf("Cluster %d: Skipping (n=%d)\n", clust, length(cluster_genes)))
+    next
+  }
+  
+  cat(sprintf("\nCluster %d: %d genes\n", clust, length(cluster_genes)))
+  
+  cluster_results <- list()
+  
+  if (hallmark_data$n_pathways > 0) {
+    res <- run_enrichment(cluster_genes, background_entrez, 
+                          hallmark_data$term2gene, hallmark_data$term2name, "Hallmark")
+    if (!is.null(res)) {
+      cluster_results[["Hallmark"]] <- res
+      n_sig <- sum(res$p.adjust < ENRICHMENT_QVAL_CUTOFF)
+      cat(sprintf("  Hallmark: %d significant\n", n_sig))
+    }
+  }
+  
+  if (kegg_data$n_pathways > 0) {
+    res <- run_enrichment(cluster_genes, background_entrez,
+                          kegg_data$term2gene, kegg_data$term2name, "KEGG_MSigDB")
+    if (!is.null(res)) {
+      cluster_results[["KEGG_MSigDB"]] <- res
+      n_sig <- sum(res$p.adjust < ENRICHMENT_QVAL_CUTOFF)
+      cat(sprintf("  KEGG (MSigDB): %d significant\n", n_sig))
+    }
+  }
+  
+  if (reactome_data$n_pathways > 0) {
+    res <- run_enrichment(cluster_genes, background_entrez,
+                          reactome_data$term2gene, reactome_data$term2name, "Reactome")
+    if (!is.null(res)) {
+      cluster_results[["Reactome"]] <- res
+      n_sig <- sum(res$p.adjust < ENRICHMENT_QVAL_CUTOFF)
+      cat(sprintf("  Reactome: %d significant\n", n_sig))
+    }
+  }
+  
+  if (gobp_data$n_pathways > 0) {
+    res <- run_enrichment(cluster_genes, background_entrez,
+                          gobp_data$term2gene, gobp_data$term2name, "GO_BP_MSigDB")
+    if (!is.null(res)) {
+      cluster_results[["GO_BP_MSigDB"]] <- res
+      n_sig <- sum(res$p.adjust < ENRICHMENT_QVAL_CUTOFF)
+      cat(sprintf("  GO BP (MSigDB): %d significant\n", n_sig))
+    }
+  }
+  
+  if (corum_data$n_pathways > 0) {
+    res <- run_enrichment(cluster_genes, background_entrez,
+                          corum_data$term2gene, corum_data$term2name, "CORUM")
+    if (!is.null(res)) {
+      cluster_results[["CORUM"]] <- res
+      n_sig <- sum(res$p.adjust < ENRICHMENT_QVAL_CUTOFF)
+      cat(sprintf("  CORUM: %d significant\n", n_sig))
+    }
+  }
+  
+  go_res <- run_enrichGO_builtin(cluster_genes, background_entrez)
+  if (!is.null(go_res)) {
+    cluster_results[["GO_BP_builtin"]] <- go_res
+    n_sig <- sum(go_res$p.adjust < ENRICHMENT_QVAL_CUTOFF)
+    cat(sprintf("  GO BP (builtin): %d significant\n", n_sig))
+  }
+  
+  kegg_res <- run_enrichKEGG_builtin(cluster_genes, background_entrez)
+  if (!is.null(kegg_res)) {
+    cluster_results[["KEGG_builtin"]] <- kegg_res
+    n_sig <- sum(kegg_res$p.adjust < ENRICHMENT_QVAL_CUTOFF)
+    cat(sprintf("  KEGG (builtin): %d significant\n", n_sig))
+  }
+  
+  ora_results_all[[paste0("cluster_", clust)]] <- cluster_results
+  
+  count_sig <- function(name) {
+    if (is.null(cluster_results[[name]])) return(0)
+    sum(cluster_results[[name]]$p.adjust < ENRICHMENT_QVAL_CUTOFF)
+  }
+  
+  ora_summary <- rbind(ora_summary, data.frame(
+    cluster = clust,
+    n_genes = length(cluster_genes),
+    intra_corr = round(cluster_intra_corr[as.character(clust)], 3),
+    n_hallmark = count_sig("Hallmark"),
+    n_kegg = count_sig("KEGG_MSigDB") + count_sig("KEGG_builtin"),
+    n_reactome = count_sig("Reactome"),
+    n_gobp = count_sig("GO_BP_MSigDB") + count_sig("GO_BP_builtin"),
+    n_corum = count_sig("CORUM"),
+    stringsAsFactors = FALSE
+  ))
+}
+
+cat("\n\nORA Summary:\n")
+print(ora_summary)
+@
+  cluster n_genes intra_corr n_hallmark n_kegg n_reactome n_gobp n_corum
+1        1      41      0.305          0      1         10     39       0
+2        2      18      0.193          0      0          0     18       0
+3        3      39      0.313          2     42          6     22       0
+4        4      49      0.102          0      4         13    182       0
+5        5      21      0.310          2      1          2     29       0
+6        6      15      0.335          0      0          0      1       0
+7        7      35      0.329          1      1          6    118       0
+8        8      47      0.359          1      0          6    132       0
+9        9      27      0.307          0      3          0     95       0
+10      10       7      0.257          0      0          0      6       0
+
+<<>>=
+# SECTION 9: COMBINE ALL ENRICHMENT RESULTS
+all_enrichments_list <- list()
+for (cluster_name in names(ora_results_all)) {
+  cluster_data <- ora_results_all[[cluster_name]]
+  if (length(cluster_data) == 0) next
+  
+  cluster_num <- as.integer(gsub("cluster_", "", cluster_name))
+  
+  for (db_name in names(cluster_data)) {
+    df <- cluster_data[[db_name]]
+    if (!is.null(df) && nrow(df) > 0) {
+      df$cluster <- cluster_num
+      all_enrichments_list[[paste0(cluster_name, "_", db_name)]] <- df
+    }
+  }
+}
+
+if (length(all_enrichments_list) > 0) {
+  all_enrichments <- do.call(rbind, all_enrichments_list)
+  rownames(all_enrichments) <- NULL
+  
+  cat(sprintf("Total enrichment results: %d\n", nrow(all_enrichments)))
+  cat(sprintf("Significant results (q < %.2f): %d\n", 
+              ENRICHMENT_QVAL_CUTOFF, 
+              sum(all_enrichments$p.adjust < ENRICHMENT_QVAL_CUTOFF, na.rm = TRUE)))
+  
+  cat("\nResults by database:\n")
+  db_summary <- all_enrichments %>%
+    group_by(database) %>%
+    summarise(
+      total = n(),
+      significant = sum(p.adjust < ENRICHMENT_QVAL_CUTOFF, na.rm = TRUE),
+      .groups = "drop"
+    )
+  print(as.data.frame(db_summary))
+  
+  cat("\nTop 3 enrichments per cluster:\n")
+  top_per_cluster <- all_enrichments %>%
+    dplyr::filter(p.adjust < ENRICHMENT_QVAL_CUTOFF) %>%
+    group_by(cluster) %>%
+    slice_min(order_by = p.adjust, n = 3) %>%
+    dplyr::select(cluster, ID, Description, database, p.adjust, Count) %>%
+    arrange(cluster, p.adjust)
+  
+  print(as.data.frame(top_per_cluster), right = FALSE)
+} else {
+  all_enrichments <- data.frame()
+  cat("No enrichment results found.\n")
+}
+@
+
+<<>>=
+# SECTION 10: CLUSTER ANNOTATION (T-CELL AWARE, LOWERCASE, WITH GO IDs)
+generate_cluster_annotation_tcell <- function(all_enrichments, qval_cutoff = ENRICHMENT_QVAL_CUTOFF) {
+  
+ # T-cell/immune priority keywords (case-insensitive)
+ # NOTE: B-cell terms are EXCLUDED since this is T-cell data
+  tcell_priority_patterns <- c(
+    "t cell|t-cell|tcr|\\bcd4\\b|\\bcd8\\b|thymocyte" = "t cell",
+    "calcineurin|nfat" = "calcineurin/nfat",
+    "cytokine|interleukin|interferon|\\bil-|\\bil2\\b|\\bifn" = "cytokine",
+    "chemokine|cxcr|cxcl|ccr\\d|ccl\\d" = "chemokine",
+    "nfkb|nf-kb|ikk|\\brel\\b" = "nfkb",
+    "jak.stat|\\bjak\\b|\\bstat[0-9]" = "jak/stat",
+    "\\btnf|death receptor|\\bfas\\b|trail|apoptosis" = "tnf/apoptosis",
+    "costimulat|cd28|ctla|icos|pd-1|pd1" = "costimulation",
+    "antigen present|\\bmhc|\\bhla" = "antigen presentation",
+    "lymphocyte activation|leukocyte activation|immune response" = "immune activation",
+    "mapk|\\berk\\b|\\bjnk\\b|\\bp38\\b" = "mapk",
+    "pi3k|\\bakt\\b|\\bmtor\\b" = "pi3k/akt/mtor",
+    "calcium|ca2\\+|calmodulin" = "calcium signaling",
+    "phospholipase|\\bplc\\b|\\bdag\\b|\\bip3\\b" = "plc signaling",
+    "proliferation" = "proliferation",
+    "differentiation" = "differentiation",
+    "complement" = "complement"
+  )
+  
+  # Terms to EXCLUDE/deprioritize (B-cell, non-immune generic terms)
+  # Terms to EXCLUDE/deprioritize (B-cell, non-immune generic terms)
+  exclude_patterns <- c(
+  "b cell|b-cell|\\bbcr\\b|bcr_|_bcr_|immunoglobulin|antibody|b lymphocyte",
+  "nephron|kidney|renal|metanephric",
+  "retinal|bipolar neuron|eye development",
+  "cardiac|heart muscle|cardiomyocyte|adrenergic.*cardio",
+  "hepat|liver development",
+  "neural crest|neuron differentiation|motor neuron|dopaminergic|oligodendrocyte",
+  "renin|estrogen|oxytocin",  # Non-T-cell KEGG pathways
+  "osteoblast"
+ # "egfr|hiv|hcmv|CXCR4"
+)
+  exclude_regex <- paste(exclude_patterns, collapse = "|")
+  
+  annotations <- data.frame()
+  
+  for (cl in sort(unique(all_enrichments$cluster))) {
+    cluster_enrich <- all_enrichments %>%
+      dplyr::filter(cluster == cl, p.adjust < qval_cutoff) %>%
+      arrange(p.adjust)
+    
+    if (nrow(cluster_enrich) == 0) {
+      annotation <- "uncharacterized"
+      top_term <- NA
+      top_db <- NA
+      top_qval <- NA
+      go_id <- NA
+      priority_match <- FALSE
+    } else {
+      # First, try to find T-cell/immune priority matches (excluding B-cell terms)
+      priority_match <- FALSE
+      best_priority_row <- NULL
+      best_priority_idx <- NULL
+      
+      for (i in seq_len(nrow(cluster_enrich))) {
+        desc_lower <- tolower(cluster_enrich$Description[i])
+        
+        # Skip if matches exclude patterns (B-cell, etc.)
+        if (grepl(exclude_regex, desc_lower, ignore.case = TRUE)) {
+          next
+        }
+        
+        for (pattern_idx in seq_along(tcell_priority_patterns)) {
+          pattern <- names(tcell_priority_patterns)[pattern_idx]
+          if (grepl(pattern, desc_lower, ignore.case = TRUE)) {
+            if (is.null(best_priority_row)) {
+              best_priority_row <- cluster_enrich[i, ]
+              best_priority_idx <- pattern_idx
+              priority_match <- TRUE
+            }
+            break
+          }
+        }
+        
+        if (priority_match) break
+      }
+      
+      # If no priority match found, take first non-excluded term
+      if (!priority_match) {
+        for (i in seq_len(nrow(cluster_enrich))) {
+          desc_lower <- tolower(cluster_enrich$Description[i])
+          if (!grepl(exclude_regex, desc_lower, ignore.case = TRUE)) {
+            best_priority_row <- cluster_enrich[i, ]
+            break
+          }
+        }
+        # If all terms are excluded, just take the top one
+        if (is.null(best_priority_row)) {
+          best_priority_row <- cluster_enrich[1, ]
+        }
+      }
+      
+      # Extract information from selected row
+      top_term <- best_priority_row$Description
+      top_db <- best_priority_row$database
+      top_qval <- best_priority_row$p.adjust
+      
+      # Get GO ID if available
+      go_id <- NA
+      term_id <- best_priority_row$ID
+      
+      if (grepl("^GO:", term_id)) {
+        # Already has GO ID
+        go_id <- term_id
+      } else if (top_db %in% c("GO_BP_MSigDB", "GO_BP")) {
+        # Try to find matching GO ID from builtin GO_BP results
+        # Extract the term name without GOBP_ prefix for matching
+        term_name_clean <- gsub("^GOBP_", "", term_id)
+        term_name_clean <- gsub("_", " ", term_name_clean)
+        
+        matching_go <- cluster_enrich %>%
+          dplyr::filter(database == "GO_BP", grepl("^GO:", ID))
+        
+        if (nrow(matching_go) > 0) {
+          # Try to match by similar description
+          for (j in seq_len(nrow(matching_go))) {
+            go_desc <- tolower(matching_go$Description[j])
+            if (grepl(substr(tolower(term_name_clean), 1, 20), go_desc) ||
+                grepl(substr(go_desc, 1, 20), tolower(term_name_clean))) {
+              go_id <- matching_go$ID[j]
+              break
+            }
+          }
+        }
+      }
+      
+      # Create clean annotation (lowercase, complete name)
+      desc_clean <- top_term
+      # Remove database prefixes
+      desc_clean <- gsub("KEGG_MEDICUS_|REACTOME_|GOBP_|HALLMARK_|REFERENCE_|PATHOGEN_", "", desc_clean)
+      # Replace underscores with spaces
+      desc_clean <- gsub("_", " ", desc_clean)
+      # Convert to lowercase
+      desc_clean <- tolower(desc_clean)
+      # Trim whitespace
+      desc_clean <- trimws(desc_clean)
+      
+      # Add GO ID if available
+      if (!is.na(go_id)) {
+        annotation <- paste0(desc_clean, " (", go_id, ")")
+      } else {
+        annotation <- desc_clean
+      }
+    }
+    
+    annotations <- rbind(annotations, data.frame(
+      cluster = cl,
+      annotation = annotation,
+      top_term = top_term,
+      top_database = top_db,
+      top_qval = top_qval,
+      go_id = go_id,
+      priority_match = priority_match,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  return(annotations)
+}
+
+# Apply the improved annotation
+cluster_annotations <- generate_cluster_annotation_tcell(all_enrichments)
+
+cat("Improved Cluster Annotations (T-cell aware, lowercase, with GO IDs):\n")
+print(cluster_annotations)
+print(all_enrichments[(all_enrichments$cluster == 3) & (all_enrichments$p.adjust < 0.1),])
+print(all_enrichments[(all_enrichments$cluster == 7) & (all_enrichments$p.adjust < 0.1),])
+
+
+# Merge with cluster characterization
+cluster_summary <- cluster_characterization %>%
+  left_join(cluster_annotations, by = "cluster") %>%
+  dplyr::select(cluster, n_genes, annotation, dominant_group, dominant_direction, 
+                intra_cluster_corr, top_term, top_database, top_qval, go_id, priority_match)
+
+cat("\n\nFull Cluster Summary:\n")
+print(as.data.frame(cluster_summary))
+
+# Create annotation lookup for heatmap
+cluster_annotation_lookup <- setNames(cluster_annotations$annotation, cluster_annotations$cluster)
+@
+
+<<>>=
+ SECTION 10b: Manual Annotation Corrections
+# Based on careful review of enrichment terms vs perturbation patterns,
+# the following clusters have better annotations than the automated selection:
+
+cat("\n--- Manual Annotation Corrections ---\n")
+
+# Store original annotations for reference
+cluster_annotations$annotation_auto <- cluster_annotations$annotation
+
+# C3: Simplify to "calcineurin signaling" (core T-cell pathway)
+# Rationale: PPP3CA (calcineurin) and CALM2 (calmodulin) are the key genes
+#            Strong Identity/Activation downregulation matches calcineurin inhibition
+cluster_annotations$annotation[cluster_annotations$cluster == 3] <- "calcineurin signaling"
+cluster_annotations$top_term[cluster_annotations$cluster == 3] <- "Calcineurin signaling (manual)"
+
+# C5: Change to "immunoregulatory interactions" 
+# Rationale: More T-cell relevant than "complement cascade"
+#            KLRC4 (NKG2 family) is a T/NK cell receptor
+cluster_annotations$annotation[cluster_annotations$cluster == 5] <- "immunoregulatory interactions"
+cluster_annotations$top_term[cluster_annotations$cluster == 5] <- "Immunoregulatory interactions (manual)"
+
+# C7: Change from "interleukin 10 signaling" to "TNF receptor signaling"
+# Rationale: Top enrichments are TNFRSF1A/1B and CD27, NOT IL-10
+#            TNF receptor signaling explains Activation ↑ pattern
+cluster_annotations$annotation[cluster_annotations$cluster == 7] <- "TNF receptor signaling"
+cluster_annotations$top_term[cluster_annotations$cluster == 7] <- "TNFS bind their physiological receptors (manual)"
+
+# C9: Change from "GMP metabolic process" to "protein localization to cell periphery"
+# Rationale: DLG1, RAP1A, CLIP3 regulate membrane protein localization
+#            This directly explains the Adhesion ↑ pattern
+cluster_annotations$annotation[cluster_annotations$cluster == 9] <- "protein localization to cell periphery (GO:1904375)"
+cluster_annotations$top_term[cluster_annotations$cluster == 9] <- "Regulation of protein localization to cell periphery (manual)"
+cluster_annotations$go_id[cluster_annotations$cluster == 9] <- "GO:1904375"
+
+cat("Corrected annotations for clusters 3, 5, 7, 9\n\n")
+
+# Print comparison of auto vs manual annotations
+cat("Annotation Comparison (auto → manual):\n")
+corrections <- cluster_annotations %>%
+  dplyr::filter(cluster %in% c(3, 5, 7, 9)) %>%
+  dplyr::select(cluster, annotation_auto, annotation)
+print(corrections)
+@
+ cluster                             annotation_auto
+1       3 egf egfr plcg calcineurin signaling pathway
+2       5                          complement cascade
+3       7                    interleukin 10 signaling
+4       9          gmp metabolic process (GO:0046037)
+                                           annotation
+1                               calcineurin signaling
+2                       immunoregulatory interactions
+3                              TNF receptor signaling
+4 protein localization to cell periphery (GO:1904375)
+
+<<>>=
+# Update the lookup
+cluster_annotation_lookup <- setNames(cluster_annotations$annotation, cluster_annotations$cluster)
+
+cat("\n\nFinal Cluster Annotations:\n")
+print(cluster_annotations[, c("cluster", "annotation", "top_qval", "priority_match")])
+@
+
+<<>>=
+# SECTION 12: VISUALIZATION - CORRELATION HEATMAP (SQUARED, CLUSTER LEGEND SEPARATE)
+cat("Creating gene correlation heatmap...\n")
+
+gene_order <- gene_cluster_df %>% arrange(cluster) %>% pull(gene)
+
+n_clusters_viz <- length(unique(gene_clusters[gene_clusters > 0]))
+
+custom_cluster_colors <- c(
+  "#a82203", "#208cc0", "#f1af3a", "#cf5e4e", "#637b31", 
+  "#003967", "#3b7c70", "#ce9642", "#898e9f", "#3b3a3e"
+)
+
+cluster_colors_viz <- setNames(
+  custom_cluster_colors[1:n_clusters_viz],
+  seq_len(n_clusters_viz)
+)
+
+corr_colors <- colorRamp2(
+  c(-0.5, -0.3, -0.1, 0, 0.1, 0.3, 0.5), 
+  c("#225bb2", "#7db0ea", "#bad6f9", "white", "#fbc2a9", "#ee956a", "#da6c42")
+)
+
+cluster_assignments <- gene_cluster_df$cluster[match(gene_order, gene_cluster_df$gene)]
+
+cluster_positions <- gene_cluster_df %>%
+  arrange(cluster) %>%
+  mutate(index = row_number()) %>%
+  group_by(cluster) %>%
+  summarise(
+    start = min(index),
+    end = max(index),
+    center = (min(index) + max(index)) / 2,
+    .groups = "drop"
+  )
+
+# Bottom annotation — hide its legend (cluster legend goes to separate PDF)
+bottom_anno <- HeatmapAnnotation(
+  Cluster = factor(cluster_assignments),
+  cluster_label = anno_empty(border = FALSE, height = unit(5, "mm")),
+  col = list(Cluster = cluster_colors_viz),
+  which = "column",
+  annotation_name_side = "left",
+  show_annotation_name = c(TRUE, FALSE),
+  annotation_name_gp = gpar(fontsize = 12),
+  simple_anno_size = unit(5, "mm"),
+  show_legend = FALSE
+)
+
+# Square heatmap — keep correlation legend
+heatmap_size <- unit(14, "cm")
+
+ht_corr <- Heatmap(
+  corr_mat[gene_order, gene_order],
+  name = "Correlation",
+  col = corr_colors,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  bottom_annotation = bottom_anno,
+  width = heatmap_size,
+  height = heatmap_size,
+  column_title = sprintf("Gene-Gene Correlation (n=%d genes with \u2265%d significant proteins)", 
+                         nrow(corr_mat), MIN_SIG_PROTEINS),
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  use_raster = TRUE,
+  raster_quality = 3,
+  heatmap_legend_param = list(
+    title = "Correlation",
+    at = c(-0.5, -0.25, 0, 0.25, 0.5),
+    labels = c("\u2264-0.5", "-0.25", "0", "0.25", "\u22650.5"),
+    legend_height = unit(4, "cm"),
+    title_gp = gpar(fontsize = 12, fontface = "bold"),
+    labels_gp = gpar(fontsize = 12)
+  )
+)
+
+# --- PDF 1: Heatmap + correlation colorbar ---
+pdf("/home/ec2-user/scitoseq/fig/fig2/fig2e.pdf", width = 9, height = 8)
+draw(ht_corr, 
+     heatmap_legend_side = "right",
+     padding = unit(c(5, 2, 2, 2), "mm"))
+
+decorate_annotation("cluster_label", {
+  n_genes <- length(gene_order)
+  for (i in 1:nrow(cluster_positions)) {
+    center_npc <- cluster_positions$center[i] / n_genes
+    grid.text(paste0("C", cluster_positions$cluster[i]), 
+              x = unit(center_npc, "npc"), 
+              y = unit(0.5, "npc"),
+              gp = gpar(fontsize = 14))
+  }
+})
+
+dev.off()
+
+# --- PDF 2: Cluster legend only (wide, single column) ---
+lgd_cluster <- Legend(
+  labels = sapply(1:n_clusters_viz, function(i) {
+    paste0("C", i, ": ", cluster_annotation_lookup[as.character(i)])
+  }),
+  legend_gp = gpar(fill = custom_cluster_colors[1:n_clusters_viz]),
+  title = "Cluster",
+  title_gp = gpar(fontsize = 11, fontface = "bold"),
+  labels_gp = gpar(fontsize = 10),
+  grid_height = unit(4, "mm"),
+  grid_width = unit(4, "mm"),
+  ncol = 1
+)
+
+pdf("/home/ec2-user/scitoseq/fig/fig2/fig2e_legend.pdf", width = 6, height = 4)
+grid.newpage()
+grid.draw(lgd_cluster)
+dev.off()
+@
+
+CLUSTER GENE INSPECTION
+
+<<>>=
+# For each cluster: list constituent genes, show per-gene Z-score profiles
+# across the 5 protein groups, and check whether direction of effect is
+# consistent with the pathway annotation.
+
+# 1. Per-gene mean Z-score across each protein group
+# For every gene in every cluster, compute mean Z-score within each protein group
+gene_group_zscores <- data.frame()
+
+for (cl in sort(unique(gene_clusters[gene_clusters > 0]))) {
+  cluster_genes <- names(gene_clusters)[gene_clusters == cl]
+  
+  for (g in cluster_genes) {
+    z_row <- zscore_for_clust[g, , drop = FALSE]
+    
+    group_means <- sapply(protein_groups, function(grp) {
+      grp_proteins <- prot_cluster_df$protein[prot_cluster_df$cluster_name == grp]
+      grp_proteins <- intersect(grp_proteins, colnames(z_row))
+      if (length(grp_proteins) == 0) return(NA)
+      mean(z_row[, grp_proteins], na.rm = TRUE)
+    })
+    
+    # Also compute overall mean absolute Z (as a measure of total effect size)
+    overall_mean_abs <- mean(abs(z_row), na.rm = TRUE)
+    
+    gene_group_zscores <- rbind(gene_group_zscores, data.frame(
+      cluster = cl,
+      gene = g,
+      n_sig = n_sig_proteins_per_gene[g],
+      mean_abs_z = round(overall_mean_abs, 3),
+      Activation = round(group_means["Activation"], 3),
+      Adhesion = round(group_means["Adhesion"], 3),
+      `Cytokine/Chemokine` = round(group_means["Cytokine/Chemokine"], 3),
+      Identity = round(group_means["Identity"], 3),
+      `Innate-like` = round(group_means["Innate-like"], 3),
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    ))
+  }
+}
+
+# 2. Print cluster-by-cluster gene lists with Z-score profiles
+for (cl in sort(unique(gene_clusters[gene_clusters > 0]))) {
+  
+  cluster_data <- gene_group_zscores[gene_group_zscores$cluster == cl, ]
+  cluster_data <- cluster_data[order(-cluster_data$mean_abs_z), ]
+  
+  annotation <- cluster_annotation_lookup[as.character(cl)]
+  n_genes_cl <- nrow(cluster_data)
+  
+  cat("\n")
+  cat(sprintf("==== C%d: %s (n = %d genes) ====\n", cl, annotation, n_genes_cl))
+  cat(sprintf("Intra-cluster correlation: %.3f\n", cluster_intra_corr[as.character(cl)]))
+  cat("\n")
+  
+  # Print top 15 genes by effect size (or all if fewer)
+  n_show <- min(15, n_genes_cl)
+  cat(sprintf("Top %d genes by mean |Z|:\n", n_show))
+  print(cluster_data[1:n_show, c("gene", "n_sig", "mean_abs_z", 
+                                  "Identity", "Activation", "Adhesion", 
+                                  "Cytokine/Chemokine", "Innate-like")], 
+        row.names = FALSE)
+  
+  if (n_genes_cl > n_show) {
+    remaining <- cluster_data[(n_show + 1):n_genes_cl, ]
+    cat(sprintf("\nRemaining %d genes: %s\n", 
+                nrow(remaining), 
+                paste(remaining$gene, collapse = ", ")))
+  }
+  
+  # Cluster-level summary: mean Z per protein group
+  cat("\nCluster mean Z-score per protein group:\n")
+  cluster_means <- colMeans(cluster_data[, c("Identity", "Activation", "Adhesion", 
+                                              "Cytokine/Chemokine", "Innate-like")], 
+                            na.rm = TRUE)
+  print(round(cluster_means, 3))
+  
+  # Direction consistency: what fraction of genes have the same sign as the
+  # cluster mean for the dominant protein group?
+  dominant_grp <- names(which.max(abs(cluster_means)))
+  dominant_sign <- sign(cluster_means[dominant_grp])
+  gene_signs <- sign(cluster_data[[dominant_grp]])
+  n_concordant <- sum(gene_signs == dominant_sign, na.rm = TRUE)
+  n_valid <- sum(!is.na(gene_signs))
+  
+  cat(sprintf("\nDominant group: %s (mean Z = %.3f)\n", dominant_grp, cluster_means[dominant_grp]))
+  cat(sprintf("Direction concordance: %d / %d genes (%.1f%%) match cluster direction\n",
+              n_concordant, n_valid, 100 * n_concordant / n_valid))
+  
+  cat("\n")
+}
+
+# 3. Full gene list per cluster (for quick reference)
+for (cl in sort(unique(gene_clusters[gene_clusters > 0]))) {
+  cluster_genes <- sort(names(gene_clusters)[gene_clusters == cl])
+  annotation <- cluster_annotation_lookup[as.character(cl)]
+  cat(sprintf("C%d (%s, n=%d): %s\n\n", 
+              cl, annotation, length(cluster_genes),
+              paste(cluster_genes, collapse = ", ")))
+}
+
+# 4. Top enrichment terms per cluster (for cross-referencing with gene lists)
+for (cl in sort(unique(gene_clusters[gene_clusters > 0]))) {
+  annotation <- cluster_annotation_lookup[as.character(cl)]
+  cat(sprintf("---- C%d: %s ----\n", cl, annotation))
+  
+  cluster_enrich <- all_enrichments %>%
+    dplyr::filter(cluster == cl, p.adjust < ENRICHMENT_QVAL_CUTOFF) %>%
+    arrange(p.adjust) %>%
+    head(5)
+  
+  if (nrow(cluster_enrich) == 0) {
+    cat("  No significant enrichments\n")
+  } else {
+    for (i in 1:nrow(cluster_enrich)) {
+      # Parse overlapping genes
+      overlap_genes_entrez <- strsplit(cluster_enrich$geneID[i], "/")[[1]]
+      
+      # Convert Entrez back to symbols for readability
+      entrez_to_symbol <- setNames(gene_to_entrez$SYMBOL, gene_to_entrez$ENTREZID)
+      overlap_genes_symbol <- entrez_to_symbol[overlap_genes_entrez]
+      overlap_genes_symbol <- overlap_genes_symbol[!is.na(overlap_genes_symbol)]
+      
+      cat(sprintf("  [%s] %s\n    q=%.2e, overlap=%d: %s\n",
+                  cluster_enrich$database[i],
+                  cluster_enrich$Description[i],
+                  cluster_enrich$p.adjust[i],
+                  cluster_enrich$overlap_size[i],
+                  paste(overlap_genes_symbol, collapse = ", ")))
+    }
+  }
+  cat("\n")
+}
+
+# 5. Focused check: C3 calcineurin genes — are they activators or inhibitors?
+c3_genes <- sort(names(gene_clusters)[gene_clusters == 3])
+
+# Known calcineurin pathway genes (activators vs inhibitors)
+calcineurin_activators <- c("PPP3CA", "PPP3CB", "PPP3CC", "PPP3R1", "PPP3R2",  # calcineurin subunits
+                            "CALM1", "CALM2", "CALM3",                          # calmodulin
+                            "NFATC1", "NFATC2", "NFATC3", "NFATC4",           # NFAT TFs
+                            "PLCG1", "PLCG2",                                   # PLCgamma
+                            "STIM1", "STIM2", "ORAI1", "ORAI2")               # CRAC channels
+
+calcineurin_inhibitors <- c("RCAN1", "RCAN2", "RCAN3",                         # regulators of calcineurin
+                            "CABIN1",                                           # calcineurin binding protein
+                            "CASP3",                                            # cleaves calcineurin
+                            "CHP1", "CHP2",                                     # calcineurin inhibitory proteins
+                            "CAIN")                                             # calcineurin inhibitor
+
+cat("C3 genes found in calcineurin ACTIVATOR list:\n")
+c3_activators <- intersect(c3_genes, calcineurin_activators)
+if (length(c3_activators) > 0) {
+  for (g in c3_activators) {
+    z_row <- gene_group_zscores[gene_group_zscores$gene == g, ]
+    cat(sprintf("  %s: Identity=%.2f, Activation=%.2f\n", 
+                g, z_row$Identity, z_row$Activation))
+  }
+} else {
+  cat("  (none)\n")
+}
+
+cat("\nC3 genes found in calcineurin INHIBITOR list:\n")
+c3_inhibitors <- intersect(c3_genes, calcineurin_inhibitors)
+if (length(c3_inhibitors) > 0) {
+  for (g in c3_inhibitors) {
+    z_row <- gene_group_zscores[gene_group_zscores$gene == g, ]
+    cat(sprintf("  %s: Identity=%.2f, Activation=%.2f\n", 
+                g, z_row$Identity, z_row$Activation))
+  }
+} else {
+  cat("  (none)\n")
+}
+
+cat("\nC3 genes NOT in either list (need manual review):\n")
+c3_unknown <- setdiff(c3_genes, c(calcineurin_activators, calcineurin_inhibitors))
+cat(sprintf("  %s\n", paste(c3_unknown, collapse = ", ")))
+
+cat("\nSummary: C3 cluster direction\n")
+c3_data <- gene_group_zscores[gene_group_zscores$cluster == 3, ]
+cat(sprintf("  Mean Identity Z = %.3f (negative = suppression)\n", mean(c3_data$Identity, na.rm = TRUE)))
+cat(sprintf("  Mean Activation Z = %.3f (negative = suppression)\n", mean(c3_data$Activation, na.rm = TRUE)))
+cat("\nIf C3 contains calcineurin ACTIVATORS with NEGATIVE Z-scores,\n")
+cat("that is PARADOXICAL (overexpressing the pathway suppresses markers).\n")
+cat("If C3 contains calcineurin INHIBITORS with NEGATIVE Z-scores,\n")
+cat("that is EXPECTED (overexpressing inhibitors mimics cyclosporine).\n")
+cat("If C3 contains ACTIVATORS with POSITIVE Z-scores, the current text is wrong.\n")
+
+# 6. Export full table for manual review
+# Add cluster annotation to the gene-level table
+gene_group_zscores$annotation <- cluster_annotation_lookup[as.character(gene_group_zscores$cluster)]
+
+output_file <- file.path(GENE_RESULTS_DIR, "cluster_gene_inspection.csv")
+# "/home/ec2-user/scitoseq/results/results_gene_level/cluster_gene_inspection.csv"
+write.csv(gene_group_zscores, output_file, row.names = FALSE)
+@
+
+\end{document}

@@ -1,0 +1,385 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+Compare IL2RA/CD25 regulators across Zhu, Arce, and Scito-perturb-seq screens
+
+1. Filter to FACS-significant genes only (Arce FDR < 0.05)
+2. Use Z-SCORES instead of LFCs for Zhu and Scito
+
+Sign conventions (after correction):
+  - Zhu (CRISPRi): Negative z-score = KD decreases IL2RA = positive regulator
+  - Arce (CRISPR KO): Negative LFC = KO decreases IL2RA = positive regulator
+  - SCITO-Perturb-seq (CRISPRa): Positive z-score = activation increases CD25 = positive regulator
+
+Expected correlations:
+  - Zhu vs Arce: POSITIVE (both loss-of-function, same sign convention)
+  - Zhu vs SCITO-Perturb-seq: NEGATIVE (CRISPRi vs CRISPRa)
+  - Arce vs SCITO-Perturb-seq: NEGATIVE (KO vs CRISPRa)
+
+<<>>=
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readr)
+  library(readxl)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+  library(gridExtra)
+})
+
+DATA_DIR <- "/home/ec2-user/scitoseq/data"
+GENE_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+
+# FACS significance threshold (matching Zhu's approach)
+FACS_FDR_THRESHOLD <- 0.05
+
+# SECTION 1: LOAD ZHU IL2RA TRANS-EFFECTS
+zhu_il2ra <- read_csv(file.path(DATA_DIR, "zhu_il2ra_trans_effects.csv"), 
+                       show_col_types = FALSE)
+
+cat(sprintf("Zhu data: %d perturbations across %d conditions\n", 
+            nrow(zhu_il2ra), length(unique(zhu_il2ra$condition))))
+cat(sprintf("Conditions: %s\n", paste(unique(zhu_il2ra$condition), collapse = ", ")))
+
+# Load DE_stats for ENSEMBL to gene name mapping
+de_stats <- read_csv(file.path(DATA_DIR, "DE_stats.suppl_table.csv"), 
+                     show_col_types = FALSE)
+
+# Create ENSEMBL to gene name mapping
+ensembl_to_gene <- de_stats %>%
+  dplyr::select(target_contrast, target_contrast_gene_name) %>%
+  distinct() %>%
+  dplyr::rename(perturbed_gene = target_contrast, 
+                gene_name = target_contrast_gene_name)
+
+# Add gene names to Zhu data
+zhu_il2ra <- zhu_il2ra %>% left_join(ensembl_to_gene, by = "perturbed_gene")
+
+cat(sprintf("Zhu genes with names: %d / %d\n", 
+            sum(!is.na(zhu_il2ra$gene_name)), nrow(zhu_il2ra)))
+
+# SECTION 2: LOAD ARCE IL2RA FACS SCREEN (BOTH CONDITIONS)
+arce_path <- file.path(DATA_DIR, "ARCE_2023-10-17819C-S1_all_screens_results.xlsx")
+arce_data <- read_excel(arce_path, sheet = "gene_summary")
+
+cat(sprintf("Arce data: %d genes\n", nrow(arce_data)))
+
+# Extract relevant columns for BOTH conditions
+arce_clean <- arce_data %>% dplyr::select(
+    gene_name = id,
+    # Stimulated Teff (CD4+ Stim72hr)
+    lfc_stim = `neg|lfc.Stimulated_Teff`,
+    fdr_stim_neg = `neg|fdr.Stimulated_Teff`,
+    fdr_stim_pos = `pos|fdr.Stimulated_Teff`,
+    # Resting Teff (CD4+ Rest)
+    lfc_rest = `neg|lfc.Resting_Teff`,
+    fdr_rest_neg = `neg|fdr.Resting_Teff`,
+    fdr_rest_pos = `pos|fdr.Resting_Teff`)
+
+# Apply sign correction and compute FDR (matching Zhu's get_mageck_pval function)
+arce_clean <- arce_clean %>% mutate(
+    # Sign-corrected LFCs (flip to match Zhu convention)
+    arce_lfc_stim = -lfc_stim, arce_lfc_rest = -lfc_rest,
+    # FDR: use the appropriate direction based on original LFC sign
+    arce_fdr_stim = ifelse(lfc_stim > 0, fdr_stim_pos, 
+                           ifelse(lfc_stim < 0, fdr_stim_neg, NA)),
+    arce_fdr_rest = ifelse(lfc_rest > 0, fdr_rest_pos, 
+                           ifelse(lfc_rest < 0, fdr_rest_neg, NA)))
+
+cat(sprintf("Arce LFC range (Stim, sign-corrected): [%.2f, %.2f]\n", 
+            min(arce_clean$arce_lfc_stim, na.rm = TRUE),
+            max(arce_clean$arce_lfc_stim, na.rm = TRUE)))
+cat(sprintf("Arce LFC range (Rest, sign-corrected): [%.2f, %.2f]\n", 
+            min(arce_clean$arce_lfc_rest, na.rm = TRUE),
+            max(arce_clean$arce_lfc_rest, na.rm = TRUE)))
+
+# Count significant genes in each condition
+n_sig_stim <- sum(arce_clean$arce_fdr_stim < FACS_FDR_THRESHOLD, na.rm = TRUE)
+n_sig_rest <- sum(arce_clean$arce_fdr_rest < FACS_FDR_THRESHOLD, na.rm = TRUE)
+cat(sprintf("\nFACS-significant genes (FDR < %.2f):\n", FACS_FDR_THRESHOLD))
+cat(sprintf("  Stimulated_Teff: %d genes\n", n_sig_stim))
+cat(sprintf("  Resting_Teff: %d genes\n", n_sig_rest))
+
+# SECTION 3: LOAD SCITO CD25 DATA (Z-SCORES)
+# Load both z-score and LFC matrices
+gene_zscore_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_zscore_mat.rds"))
+gene_lfc_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_lfc_mat.rds"))
+
+if ("CD25" %in% colnames(gene_zscore_mat)) {
+  scito_cd25 <- data.frame(
+    gene_name = rownames(gene_zscore_mat),
+    scito_cd25_zscore = gene_zscore_mat[, "CD25"],
+    scito_cd25_lfc = gene_lfc_mat[, "CD25"]
+  )
+  cat(sprintf("SCITO-Perturb-seq CD25: %d genes\n", nrow(scito_cd25)))
+  cat(sprintf("SCITO-Perturb-seq CD25 z-score range: [%.2f, %.2f]\n",
+              min(scito_cd25$scito_cd25_zscore, na.rm = TRUE),
+              max(scito_cd25$scito_cd25_zscore, na.rm = TRUE)))
+  cat(sprintf("SCITO-Perturb-seq CD25 LFC range: [%.2f, %.2f]\n",
+              min(scito_cd25$scito_cd25_lfc, na.rm = TRUE),
+              max(scito_cd25$scito_cd25_lfc, na.rm = TRUE)))
+} else {
+  stop("CD25 not found in scito data!")
+}
+
+# SECTION 4: FUNCTION TO COMPUTE CORRELATIONS WITH FILTERING
+compute_correlation <- function(zhu_data, arce_data, scito_data, 
+                                 zhu_condition, arce_condition,
+                                 facs_fdr_threshold = 0.05,
+                                 n_bootstrap = 100, bootstrap_frac = 0.7) {
+  
+  # Select appropriate Arce columns based on condition
+  if (arce_condition == "Stimulated_Teff") {
+    arce_subset <- arce_data %>%
+      dplyr::select(gene_name, arce_lfc = arce_lfc_stim, arce_fdr = arce_fdr_stim)
+  } else {
+    arce_subset <- arce_data %>%
+      dplyr::select(gene_name, arce_lfc = arce_lfc_rest, arce_fdr = arce_fdr_rest)
+  }
+  
+  # Filter Zhu to specified condition
+  zhu_subset <- zhu_data %>%
+    filter(condition == zhu_condition) %>%
+    filter(!is.na(gene_name)) %>%
+    dplyr::select(gene_name, zhu_zscore = il2ra_zscore, zhu_lfc = il2ra_lfc)
+  
+  # ==== KEY FILTERING STEP: Only FACS-significant genes ====
+  arce_sig <- arce_subset %>%
+    filter(arce_fdr < facs_fdr_threshold)
+  
+  cat(sprintf("  Arce %s genes with FDR < %.2f: %d\n", 
+              arce_condition, facs_fdr_threshold, nrow(arce_sig)))
+  
+  # Merge all three datasets (intersection)
+  merged <- inner_join(zhu_subset, arce_sig, by = "gene_name") %>%
+    inner_join(scito_data, by = "gene_name") %>%
+    filter(is.finite(zhu_zscore) & is.finite(arce_lfc) & is.finite(scito_cd25_zscore))
+  
+  cat(sprintf("  Genes in three-way intersection (FACS-sig): %d\n", nrow(merged)))
+  
+  if (nrow(merged) < 10) {
+    warning("Too few genes for reliable correlation!")
+    return(NULL)
+  }
+  
+  # Bootstrap correlations
+  set.seed(42)
+  n_genes <- nrow(merged)
+  
+  boot_zhu_arce <- numeric(n_bootstrap)
+  boot_zhu_scito <- numeric(n_bootstrap)
+  boot_arce_scito <- numeric(n_bootstrap)
+  
+  for (i in 1:n_bootstrap) {
+    idx <- sample(n_genes, round(n_genes * bootstrap_frac), replace = TRUE)
+    boot_zhu_arce[i] <- cor(merged$zhu_zscore[idx], merged$arce_lfc[idx], method = "pearson")
+    boot_zhu_scito[i] <- cor(merged$zhu_zscore[idx], merged$scito_cd25_zscore[idx], method = "pearson")
+    boot_arce_scito[i] <- cor(merged$arce_lfc[idx], merged$scito_cd25_zscore[idx], method = "pearson")
+  }
+  
+  # Compute point estimates and CIs
+  results <- list(
+    zhu_condition = zhu_condition,
+    arce_condition = arce_condition,
+    n_genes = nrow(merged),
+    
+    zhu_arce_r = cor(merged$zhu_zscore, merged$arce_lfc),
+    zhu_arce_ci = quantile(boot_zhu_arce, c(0.025, 0.975)),
+    zhu_arce_boot_mean = mean(boot_zhu_arce),
+    
+    zhu_scito_r = cor(merged$zhu_zscore, merged$scito_cd25_zscore),
+    zhu_scito_ci = quantile(boot_zhu_scito, c(0.025, 0.975)),
+    zhu_scito_boot_mean = mean(boot_zhu_scito),
+    
+    arce_scito_r = cor(merged$arce_lfc, merged$scito_cd25_zscore),
+    arce_scito_ci = quantile(boot_arce_scito, c(0.025, 0.975)),
+    arce_scito_boot_mean = mean(boot_arce_scito),
+    
+    data = merged
+  )
+  
+  return(results)
+}
+@
+
+<<>>=
+# SECTION 5: COMPUTE CORRELATIONS FOR ALL CONDITION COMBINATIONS
+# Test all combinations of Zhu and Arce conditions
+zhu_conditions <- c("Rest", "Stim8hr", "Stim48hr")
+arce_conditions <- c("Stimulated_Teff", "Resting_Teff")
+
+all_results <- list()
+result_summary <- data.frame()
+
+for (zhu_cond in zhu_conditions) {
+  for (arce_cond in arce_conditions) {
+    cat(sprintf("\n--- Zhu %s vs Arce %s ---\n", zhu_cond, arce_cond))
+    
+    res <- compute_correlation(
+      zhu_il2ra, arce_clean, scito_cd25,
+      zhu_condition = zhu_cond,
+      arce_condition = arce_cond,
+      facs_fdr_threshold = FACS_FDR_THRESHOLD,
+      n_bootstrap = 100,
+      bootstrap_frac = 0.7
+    )
+    
+    if (!is.null(res)) {
+      key <- paste(zhu_cond, arce_cond, sep = "_")
+      all_results[[key]] <- res
+      
+      result_summary <- rbind(result_summary, data.frame(
+        zhu_condition = zhu_cond,
+        arce_condition = arce_cond,
+        n_genes = res$n_genes,
+        zhu_arce_r = res$zhu_arce_r,
+        zhu_arce_ci_low = res$zhu_arce_ci[1],
+        zhu_arce_ci_high = res$zhu_arce_ci[2],
+        zhu_scito_r = res$zhu_scito_r,
+        zhu_scito_ci_low = res$zhu_scito_ci[1],
+        zhu_scito_ci_high = res$zhu_scito_ci[2],
+        arce_scito_r = res$arce_scito_r,
+        arce_scito_ci_low = res$arce_scito_ci[1],
+        arce_scito_ci_high = res$arce_scito_ci[2]
+      ))
+    }
+  }
+}
+@
+
+<<>>=
+# Two-panel validation plot: Zhu vs SCITO-Perturb-seq | Arce vs SCITO-Perturb-seq
+# Condition: Zhu Rest x Arce Stimulated_Teff, FACS-sig genes (FDR < 0.05)
+# Reports both Pearson r and Spearman rho with p-values
+
+theme_pub <- function(base_size = 15) {
+  theme_bw(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", size = rel(1.2)),
+      plot.subtitle = element_text(size = rel(0.9), color = "gray30"),
+      #axis.title = element_text(face = "bold"),
+      axis.text = element_text(color = "black"),
+      panel.grid.minor = element_blank(),
+      legend.background = element_rect(fill = "white", color = NA))
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(cowplot)
+})
+
+# --- Load data ---
+plot_data <- all_results[["Rest_Stimulated_Teff"]]$data
+
+# --- Correlation tests (Pearson + Spearman) ---
+# Zhu vs SCITO
+pearson_zhu  <- cor.test(plot_data$zhu_zscore, plot_data$scito_cd25_zscore, method = "pearson")
+spearman_zhu <- cor.test(plot_data$zhu_zscore, plot_data$scito_cd25_zscore, method = "spearman")
+
+# Arce vs SCITO
+pearson_arce  <- cor.test(plot_data$arce_lfc, plot_data$scito_cd25_zscore, method = "pearson")
+spearman_arce <- cor.test(plot_data$arce_lfc, plot_data$scito_cd25_zscore, method = "spearman")
+
+# Print for reference
+cat("=== Zhu Rest vs SCITO-Perturb-seq CD25 ===\n")
+cat(sprintf("  Pearson:  r = %.3f, p = %.4f\n", pearson_zhu$estimate, pearson_zhu$p.value))
+cat(sprintf("  Spearman: rho = %.3f, p = %.4f\n", spearman_zhu$estimate, spearman_zhu$p.value))
+
+cat("\n=== Arce Stim72hr vs SCITO-Perturb-seq CD25 ===\n")
+cat(sprintf("  Pearson:  r = %.3f, p = %.4f\n", pearson_arce$estimate, pearson_arce$p.value))
+cat(sprintf("  Spearman: rho = %.3f, p = %.4f\n", spearman_arce$estimate, spearman_arce$p.value))
+
+# --- Sensitivity: exclude IL2RA (positive control) ---
+plot_data_noIL2RA <- plot_data %>% filter(gene_name != "IL2RA")
+
+pearson_zhu_noIL2RA  <- cor.test(plot_data_noIL2RA$zhu_zscore, plot_data_noIL2RA$scito_cd25_zscore)
+spearman_zhu_noIL2RA <- cor.test(plot_data_noIL2RA$zhu_zscore, plot_data_noIL2RA$scito_cd25_zscore, method = "spearman")
+pearson_arce_noIL2RA  <- cor.test(plot_data_noIL2RA$arce_lfc, plot_data_noIL2RA$scito_cd25_zscore)
+spearman_arce_noIL2RA <- cor.test(plot_data_noIL2RA$arce_lfc, plot_data_noIL2RA$scito_cd25_zscore, method = "spearman")
+
+cat("\n=== Sensitivity: excluding IL2RA ===\n")
+cat(sprintf("  Zhu vs SCITO:  Pearson r = %.3f (p = %.4f), Spearman rho = %.3f (p = %.4f)\n",
+            pearson_zhu_noIL2RA$estimate, pearson_zhu_noIL2RA$p.value,
+            spearman_zhu_noIL2RA$estimate, spearman_zhu_noIL2RA$p.value))
+cat(sprintf("  Arce vs SCITO: Pearson r = %.3f (p = %.4f), Spearman rho = %.3f (p = %.4f)\n",
+            pearson_arce_noIL2RA$estimate, pearson_arce_noIL2RA$p.value,
+            spearman_arce_noIL2RA$estimate, spearman_arce_noIL2RA$p.value))
+
+# --- Helper to format p-value ---
+fmt_p <- function(p) {
+  if (p < 0.001) return(sprintf("%.1e", p))
+  sprintf("%.3f", p)
+}
+
+sub_zhu <- sprintf("r = %.2f, p = %s | n = %d",
+                   pearson_zhu$estimate, fmt_p(pearson_zhu$p.value),
+                   nrow(plot_data))
+
+# \u03C1 = %.2f, p = %s |
+sub_arce <- sprintf("r = %.2f, p = %s | n = %d",
+                    pearson_arce$estimate, fmt_p(pearson_arce$p.value),
+                    nrow(plot_data))
+
+# --- Shared plot elements ---
+dot_color <- "gray30"
+dot_alpha <- 0.6
+dot_size  <- 2
+label_size <- 4#2.8
+label_color <- "gray20"
+
+# --- Left panel: Zhu vs SCITO-Perturb-seq ---
+p1 <- ggplot(plot_data, aes(x = zhu_zscore, y = scito_cd25_zscore)) +
+  geom_point(alpha = dot_alpha, size = dot_size, color = dot_color) +
+  geom_text_repel(aes(label = gene_name),
+                  size = label_size, color = label_color,
+                  max.overlaps = Inf, seed = 42,
+                  segment.color = "gray70", segment.size = 0.3,
+                  box.padding = 0.4, point.padding = 0.3,
+                  min.segment.length = 0.2) +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue",
+              linetype = "dashed", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "gray40") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray40") +
+  labs(
+    title = "Zhu et al. vs SCITO-Perturb-seq",
+    subtitle = sub_zhu,
+    x = "Zhu IL2RA z-score (CRISPRi, Rest)",
+    y = "SCITO-Perturb-seq CD25 z-score (CRISPRa)"
+  ) + theme_pub()
+
+# --- Right panel: Arce vs SCITO-Perturb-seq ---
+p2 <- ggplot(plot_data, aes(x = arce_lfc, y = scito_cd25_zscore)) +
+  geom_point(alpha = dot_alpha, size = dot_size, color = dot_color) +
+  geom_text_repel(aes(label = gene_name),
+                  size = label_size, color = label_color,
+                  max.overlaps = Inf, seed = 42,
+                  segment.color = "gray70", segment.size = 0.3,
+                  box.padding = 0.4, point.padding = 0.3,
+                  min.segment.length = 0.2) +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue",
+              linetype = "dashed", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "gray40") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "gray40") +
+  labs(
+    title = "Arce et al. vs SCITO-Perturb-seq",
+    subtitle = sub_arce,
+    x = "Arce IL2RA LFC (CRISPR KO, Stim72hr)",
+    y = "SCITO-Perturb-seq CD25 z-score (CRISPRa)"
+  ) +
+  theme_pub() #+
+  # theme(plot.title    = element_text(size = 11, face = "bold"),
+  #       plot.subtitle = element_text(size = 8))
+
+# --- Combine ---
+combined <- plot_grid(p1, p2, ncol = 2, align = "h", axis = "tb")
+print(combined)
+
+ggsave("~/scitoseq/fig/fig1_zhu_arce_vs_scito.pdf", combined, width = 12, height = 6)
+@
+
+\end{document}

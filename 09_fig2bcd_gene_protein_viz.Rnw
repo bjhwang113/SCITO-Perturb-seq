@@ -1,0 +1,455 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+<<>>=
+# GENE-PROTEIN HITS VISUALIZATION v3
+
+#  conda activate r_conda_env
+# conda install -c conda-forge r-ggrastr
+
+suppressPackageStartupMessages({
+  library(grid)
+  library(dplyr)
+  library(tidyr)
+  library(ggrastr)
+  library(Matrix)
+  library(scales)
+  library(ggplot2)
+  library(stringr)
+  library(circlize)
+  library(gridExtra)
+  library(patchwork)
+  library(RColorBrewer)
+  library(ComplexHeatmap)
+})
+
+set.seed(42)
+
+# PARAMETERS
+INPUT_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+CORR_DIR <- "/home/ec2-user/scitoseq/results/results_correlation"
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/results/visualization_gene_protein_V3"
+fig_dir <- "/home/ec2-user/scitoseq/fig/fig2"
+#dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Significance thresholds
+FDR_THRESHOLD <- 0.10
+FDR_STRICT <- 0.05
+LFC_THRESHOLD <- 0.1
+
+# Visualization parameters
+MAX_GENES_LABEL <- 30
+VOLCANO_XLIM <- c(-1, 3.5)#c(-1.5, 2.5)
+VOLCANO_YLIM_MAX <- 18#15
+
+# FDR SELECTION
+# Options: "global", "per_protein", "per_gene"
+FDR_VERSION <- "per_protein"
+
+cat("GENE-PROTEIN HITS VISUALIZATION v3\n")
+cat(sprintf("FDR version: %s\n", FDR_VERSION))
+cat(sprintf("FDR threshold: %.2f\n", FDR_THRESHOLD))
+#cat(sprintf("Output directory: %s\n", OUTPUT_DIR))
+@
+
+<<>>=
+# SECTION 1: LOAD DATA
+# Load gene-level matrices
+gene_lfc_mat <- readRDS(file.path(INPUT_DIR, "gene_lfc_mat.rds"))
+gene_se_mat <- readRDS(file.path(INPUT_DIR, "gene_se_mat.rds"))
+gene_zscore_mat <- readRDS(file.path(INPUT_DIR, "gene_zscore_mat.rds"))
+gene_pval_mat <- readRDS(file.path(INPUT_DIR, "gene_pval_mat.rds"))
+gene_ncells <- readRDS(file.path(INPUT_DIR, "gene_ncells.rds"))
+
+cat(sprintf("Loaded matrices: %d genes × %d proteins\n", 
+            nrow(gene_lfc_mat), ncol(gene_lfc_mat)))
+
+# Load FDR matrices - FIXED: use correct directories
+cat(sprintf("\nLoading FDR matrix: %s\n", FDR_VERSION))
+# Loaded matrices: 17336 genes × 201 proteins
+
+if (FDR_VERSION == "global") {
+  gene_qval_mat <- readRDS(file.path(INPUT_DIR, "gene_qval_mat.rds"))
+  cat("Using GLOBAL FDR (BH across 3.5M tests) - most conservative\n")
+} else if (FDR_VERSION == "per_protein") {
+  # FIXED: per-protein FDR is in CORR_DIR
+  gene_qval_mat <- readRDS(file.path(INPUT_DIR, "gene_qval_per_protein.rds"))
+  cat("Using PER-PROTEIN FDR (BH across 17K genes per protein)\n")
+} else if (FDR_VERSION == "per_gene") {
+  # FIXED: per-gene FDR is in CORR_DIR
+  gene_qval_mat <- readRDS(file.path(INPUT_DIR, "gene_qval_per_gene.rds"))
+  cat("WARNING: Using PER-GENE FDR (only 201 tests per gene) - may inflate false positives!\n")
+} else {
+  stop("Invalid FDR_VERSION. Choose: 'global', 'per_protein', or 'per_gene'")
+}
+
+# Load self-targeted data
+self_targeted_gene <- readRDS(file.path(INPUT_DIR, "self_targeted_gene.rds"))
+self_targeted_pairs <- paste(self_targeted_gene$gene, self_targeted_gene$protein, sep = "_")
+
+# SECTION 2: LOAD NTC-BASED PROTEIN CLUSTERING
+prot_cluster_df <- readRDS(file.path(CORR_DIR, "prot_cluster_df_ntc.rds"))
+
+cat("Protein clusters:\n")
+print(table(prot_cluster_df$cluster_name))
+
+cluster_colors <- c(
+  "Activation" = "#d7aca1",
+  "Adhesion" = "#79ad41",
+  "Cytokine/Chemokine" =  "#4063a3",
+  "Identity" = "#ddc000",
+  "Innate-like" = "#34b6c6"
+)
+
+protein_to_cluster <- setNames(prot_cluster_df$cluster_name, prot_cluster_df$protein)
+
+# SECTION 3: CREATE LONG-FORMAT DATA FRAME
+all_genes <- rownames(gene_lfc_mat)
+all_proteins <- colnames(gene_lfc_mat)
+
+hits_df <- expand.grid(
+  gene = all_genes, protein = all_proteins, stringsAsFactors = FALSE) %>%
+  mutate(
+    lfc = as.vector(gene_lfc_mat),
+    se = as.vector(gene_se_mat),
+    zscore = as.vector(gene_zscore_mat),
+    pval = as.vector(gene_pval_mat),
+    qval = as.vector(gene_qval_mat),
+    n_cells = gene_ncells[gene],
+    pair_id = paste(gene, protein, sep = "_"),
+    self_targeted = pair_id %in% self_targeted_pairs,
+    neg_log10_pval = -log10(pval),
+    neg_log10_qval = -log10(qval),
+    cluster = protein_to_cluster[protein]
+  ) %>% filter(!is.na(lfc), !is.na(pval), is.finite(zscore))
+
+# Cap extreme values
+hits_df$neg_log10_pval_capped <- pmin(hits_df$neg_log10_pval, VOLCANO_YLIM_MAX)
+hits_df$lfc_capped <- pmax(pmin(hits_df$lfc, VOLCANO_XLIM[2]), VOLCANO_XLIM[1])
+
+range(hits_df$lfc) # -0.8199971  8.3108729
+sum(hits_df$lfc > 3) # 17
+sum(hits_df$lfc > 3.5) # 8
+sum(hits_df$lfc > 4) # 7
+sum(hits_df$lfc > 5) # 1
+sum((hits_df$lfc < 3) & (hits_df$lfc > 2.5)) # 28
+
+# Add significance categories - SIMPLIFIED: just significant (red) vs not (gray)
+# Self-targeted genes use same coloring, but always get labeled in volcanos
+hits_df <- hits_df %>% mutate(
+    is_significant = qval < FDR_THRESHOLD,
+    sig_category = factor(
+      ifelse(is_significant, "Significant", "Not significant"),
+      levels = c("Not significant", "Significant")))
+
+cat(sprintf("Total gene-protein pairs: %s\n", format(nrow(hits_df), big.mark = ",")))
+cat(sprintf("Significant pairs (FDR < %.2f): %d\n", 
+            FDR_THRESHOLD, sum(hits_df$qval < FDR_THRESHOLD, na.rm = TRUE)))
+
+# SECTION 4: PER-PROTEIN SUMMARY STATISTICS
+protein_summary <- hits_df %>% group_by(protein, cluster) %>% summarise(
+    n_genes = n(),
+    n_sig_fdr10 = sum(qval < FDR_THRESHOLD, na.rm = TRUE),
+    n_sig_fdr05 = sum(qval < FDR_STRICT, na.rm = TRUE),
+    n_up_fdr10 = sum(qval < FDR_THRESHOLD & lfc > 0, na.rm = TRUE),
+    n_down_fdr10 = sum(qval < FDR_THRESHOLD & lfc < 0, na.rm = TRUE),
+    n_self_targeted = sum(self_targeted),
+    mean_lfc = mean(lfc, na.rm = TRUE),
+    max_lfc = max(lfc, na.rm = TRUE),
+    min_lfc = min(lfc, na.rm = TRUE),
+    .groups = "drop") %>% arrange(desc(n_sig_fdr10))
+
+cat(sprintf("Proteins with ≥1 significant hit: %d / %d\n",
+            sum(protein_summary$n_sig_fdr10 > 0), nrow(protein_summary)))
+
+# Cluster summary
+cluster_summary <- protein_summary %>% group_by(cluster) %>% summarise(
+    n_proteins = n(), total_hits = sum(n_sig_fdr10),
+    mean_hits_per_protein = round(mean(n_sig_fdr10), 1),
+    .groups = "drop") %>% arrange(desc(total_hits))
+
+cat("\nSignificant hits by cluster:\n")
+print(cluster_summary)
+@
+
+  cluster            n_proteins total_hits mean_hits_per_protein
+  <chr>                   <int>      <int>                 <dbl>
+1 Activation                 42       1643                  39.1
+2 Adhesion                   39       1379                  35.4
+3 Identity                   24       1008                  42  
+4 Cytokine/Chemokine         39        134                   3.4
+5 Innate-like                57        133                   2.3
+
+<<>>=
+# SECTION 5: THEME AND HELPERS
+theme_publication <- theme_bw(base_size = 16) + theme(
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.5),
+    axis.text = element_text(color = "black"),
+    #axis.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.background = element_rect(fill = "white", color = NA),
+    strip.background = element_rect(fill = "grey90", color = "black"),
+    strip.text = element_text(face = "bold", size = 10),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "grey30"))
+
+# Signed log transform: sign(x) * log10(|x| + 1)
+signed_log10 <- function(x) {sign(x) * log10(abs(x) + 1)}
+
+# Inverse for axis labels
+signed_log10_inv <- function(x) {sign(x) * (10^abs(x) - 1)}
+
+# LEVEL 1: OVERVIEW - Bar Plot with Log Scale Option
+# Prepare data
+bar_data <- protein_summary %>%
+  select(protein, cluster, n_up_fdr10, n_down_fdr10) %>% pivot_longer(
+    cols = c(n_up_fdr10, n_down_fdr10), names_to = "direction",
+    values_to = "count") %>% mutate(
+    direction = ifelse(direction == "n_up_fdr10", "Upregulated", "Downregulated"),
+    count_signed = ifelse(direction == "Upregulated", count, -count),
+    # Signed log transform
+    count_signed_log = signed_log10(count_signed))
+
+# Order proteins by total hits
+protein_order <- protein_summary %>%
+  arrange(desc(n_sig_fdr10)) %>% pull(protein)
+
+bar_data$protein <- factor(bar_data$protein, levels = protein_order)
+
+# Log scale (better for per-protein/per-gene FDR)
+# Custom breaks for signed log scale
+max_val <- max(abs(bar_data$count_signed), na.rm = TRUE)
+log_breaks <- c(-100, -50, -20, -10, -5, 0, 5, 10, 20, 50, 100, 200, 500)
+log_breaks <- log_breaks[abs(log_breaks) <= max_val * 1.1]
+
+p_level1_log <- ggplot(bar_data, aes(x = protein, y = count_signed_log, fill = direction)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  scale_fill_manual(
+    values = c("Upregulated" = "#D73027", "Downregulated" = "#4575B4"),
+    name = "Effect Direction") +
+  scale_y_continuous(
+    breaks = signed_log10(log_breaks),
+    labels = log_breaks, name = "# Significant Regulators (log scale)") +
+  labs(
+    #title = "Genome-Wide Regulators of Surface Protein Expression",
+    title = sprintf("Genome-Wide Regulators of Surface Protein Expression (%s FDR < %.2f)", 
+                       toupper(gsub("_", "-", FDR_VERSION)), FDR_THRESHOLD),
+    x = "Surface Protein") +
+  theme_publication + theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 9),
+    legend.position = "top")
+p_level1_log
+ggsave(file.path(fig_dir, "level1_barplot_log.pdf"), p_level1_log, width = 25, height = 6)
+@
+
+<<>>=
+library(ggrepel)
+library(patchwork)
+
+N_LABELS <- 15
+VOLCANO_XLIM <- c(-1.5, 3.4)#c(-2, 3.5)
+VOLCANO_YLIM_MAX <- 15
+
+# Publication theme – unified sizing for Nature Biotech
+theme_publication <- theme_bw(base_size = 8) + theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(linewidth = 0.3, color = "grey90"),
+    panel.border = element_rect(linewidth = 0.6, color = "black"),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(size = 10),
+    plot.title = element_text(size = 12, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey30"),
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 8, face = "bold"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 8)
+  )
+
+create_protein_volcano_panel <- function(
+    protein_name, data, n_label = N_LABELS, 
+    fdr_threshold = FDR_THRESHOLD) {
+  
+  prot_data <- data %>% filter(protein == protein_name) %>% arrange(pval)
+  
+  if (nrow(prot_data) == 0) {
+    warning(sprintf("No data found for protein: %s", protein_name))
+    return(NULL)
+  }
+  
+  self_target_data <- prot_data %>% filter(self_targeted)
+  
+  top_hits_other <- prot_data %>% filter(qval < fdr_threshold, !self_targeted) %>%
+    arrange(desc(abs(zscore))) %>% head(n_label)
+  
+  genes_to_label <- bind_rows(self_target_data, top_hits_other) %>%
+    distinct(gene, .keep_all = TRUE)
+  
+  n_up <- sum(prot_data$qval < fdr_threshold & prot_data$lfc > 0, na.rm = TRUE)
+  n_down <- sum(prot_data$qval < fdr_threshold & prot_data$lfc < 0, na.rm = TRUE)
+  n_total <- n_up + n_down
+  
+  if (nrow(self_target_data) > 0) {
+    self_target_status <- self_target_data %>%
+      mutate(status = paste0(gene, " (", ifelse(is_significant, "sig", "ns"), ")")) %>%
+      pull(status) %>% paste(collapse = ", ")
+  } else {
+    self_target_status <- "none"
+  }
+  
+  prot_data <- prot_data %>%
+    mutate(sig_direction = case_when(
+      qval >= fdr_threshold ~ "NS",
+      lfc_capped >= 0 ~ "Up",
+      lfc_capped < 0 ~ "Down"
+    ))
+  
+  p <- ggplot(prot_data, aes(x = lfc_capped, y = neg_log10_pval_capped)) +
+    rasterise(geom_point(data = prot_data %>% filter(sig_direction == "NS"),
+               color = "grey70", alpha = 0.5, size = 0.6), dpi = 300) +
+    rasterise(geom_point(data = prot_data %>% filter(sig_direction == "Up"),
+               color = "#DC3545", alpha = 0.6, size = 0.6), dpi = 300) +
+    rasterise(geom_point(data = prot_data %>% filter(sig_direction == "Down"),
+               color = "#2166AC", alpha = 0.6, size = 0.6), dpi = 300) +
+    geom_text_repel(
+      data = genes_to_label, aes(label = gene),
+      size = 3, #2.5,
+      max.overlaps = 30,
+      segment.color = "grey50",
+      segment.size = 0.2,
+      min.segment.length = 0,
+      box.padding = 0.25,
+      point.padding = 0.15,
+      force = 2,
+      fontface = "italic"
+    ) +
+    geom_point(
+      data = self_target_data,
+      shape = 21, size = 1.8, stroke = 0.6,
+      color = "black", fill = NA) +
+    # Removed nominal p-value dashed line (not meaningful with FDR)
+    geom_vline(xintercept = 0, color = "grey40", linewidth = 0.3) +
+    labs(
+      title = protein_name,
+      subtitle = sprintf("Hits: %d (up %d, down %d) | Self: %s", 
+                         n_total, n_up, n_down, self_target_status),
+      x = "Normalized Expression Difference (vs. NTC)",
+      y = expression(-log[10](italic(p)))) +
+    coord_cartesian(xlim = VOLCANO_XLIM, ylim = c(0, VOLCANO_YLIM_MAX)) +
+    theme_publication
+  
+  return(p)
+}
+
+create_volcano_2x2_patchwork <- function(proteins, data, output_path = NULL) {
+  
+  plots <- lapply(proteins, function(prot) {
+    create_protein_volcano_panel(prot, data)
+  })
+  names(plots) <- proteins
+  plots <- plots[!sapply(plots, is.null)]
+  
+  legend_df <- data.frame(
+    x = c(1, 1, 1), y = c(3, 2, 1),
+    label = factor(c("Up", "Down", "Not significant"),
+                   levels = c("Up", "Down", "Not significant")),
+    color = c("#DC3545", "#2166AC", "grey70"))
+  
+  legend_plot <- ggplot(legend_df, aes(x, y, color = label)) +
+    geom_point(size = 2) + scale_color_manual(
+      values = c("Up" = "#DC3545", 
+                 "Down" = "#2166AC", 
+                 "Not significant" = "grey70"),
+      name = expression(bold("FDR < 0.1"))) + theme_void() +
+    theme(legend.position = "right",
+          legend.title = element_text(size = 9, face = "bold"),
+          legend.text = element_text(size = 9)) +
+    guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+  
+  legend_grob <- cowplot::get_legend(legend_plot)
+  
+  for (i in seq_along(plots)) {
+    plots[[i]] <- plots[[i]] + theme(axis.title.x = element_blank())
+  }
+  
+  combined <- (plots[[1]] + plots[[2]]) / (plots[[3]] + plots[[4]]) +
+    plot_annotation(
+    caption = "Normalized Expression Difference (vs. NTC)",
+    theme = theme(
+      plot.caption = element_text(size = 10, hjust = 0.5, face = "plain",
+                                  margin = margin(t = 5))))
+  
+    final_plot <- cowplot::plot_grid(
+    combined, legend_grob, nrow = 1,
+    rel_widths = c(1, 0.15))
+  
+  if (!is.null(output_path)) {
+    ggsave(output_path, final_plot, width = 8.5, height = 7, dpi = 300)
+    cat(sprintf("Figure saved to: %s\n", output_path))
+  }
+  
+  return(final_plot)
+}
+
+fig <- create_volcano_2x2_patchwork(
+  proteins = c("CD278", "CD223", "CD5", "CD134"),
+  data = hits_df,
+  output_path = file.path(fig_dir, "volcano_2x2_selected_v2.pdf")
+)
+fig
+@
+
+<<>>=
+# GLOBAL VOLCANO
+set.seed(42)
+global_sample <- bind_rows(
+  hits_df %>% filter(qval < FDR_THRESHOLD | self_targeted),
+  hits_df %>% filter(qval >= FDR_THRESHOLD, !self_targeted) %>% sample_n(min(300000, n()))#sample_n(min(300000, n()))
+)
+self_targeted_global <- global_sample %>% filter(self_targeted)
+
+VOLCANO_XLIM <- c(-1, 3.5)
+VOLCANO_YLIM_MAX <- 16
+
+p_global <- ggplot(global_sample, aes(x = lfc_capped, y = neg_log10_pval_capped)) +
+  # Non-significant points
+  rasterise(geom_point(data = global_sample %>% filter(sig_category == "Not significant"),
+             color = "grey85", alpha = 0.2, size = 0.2), dpi = 300) +
+  # Significant up (red)
+  rasterise(geom_point(data = global_sample %>% filter(sig_category == "Significant", lfc_capped >= 0),
+             color = "#DC3545", alpha = 0.5, size = 0.6), dpi = 300) +
+  # Significant down (blue)
+  rasterise(geom_point(data = global_sample %>% filter(sig_category == "Significant", lfc_capped < 0),
+             color = "#2166AC", alpha = 0.5, size = 0.6), dpi = 300) +
+  # Self-targeted: highlight with black ring
+  geom_point(data = self_targeted_global,
+             shape = 21, size = 1.8, stroke = 0.6,
+             color = "black", fill = NA) +
+  # Reference line (vertical only)
+  geom_vline(xintercept = 0, color = "grey40", linewidth = 0.3) +
+  # Boxed annotation
+  annotate("label", x = 3.3, y = VOLCANO_YLIM_MAX - 1,
+           label = sprintf("Significant: %s\nSelf-targeted: %d",
+                           format(sum(hits_df$qval < FDR_THRESHOLD, na.rm = TRUE), big.mark = ","),
+                           sum(hits_df$self_targeted)),
+           hjust = 1, size = 2.8, fontface = "italic",
+           fill = "white", label.size = 0.3, label.padding = unit(0.4, "lines"),
+           label.r = unit(0, "lines")) +
+  labs(title = "Global Gene-Protein Effects",
+       subtitle = sprintf("%s pairs | FDR < %g | Black rings = self-targeted",
+                          format(nrow(hits_df), big.mark = ","), FDR_THRESHOLD),
+       x = "Normalized Expression Difference (vs. NTC)",
+       y = expression(-log[10](italic(p)))) +
+  coord_cartesian(xlim = VOLCANO_XLIM, ylim = c(0, VOLCANO_YLIM_MAX)) +
+  theme_publication +
+  theme(legend.position = "none")
+
+#p_global
+ggsave(file.path(fig_dir, "global_volcano_sample300k.pdf"), p_global, 
+       width = 8, height = 6, dpi = 300)
+@
+
+\end{document}

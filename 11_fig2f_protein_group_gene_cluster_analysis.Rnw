@@ -1,0 +1,356 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+Purpose: Visualize how gene clusters differentially affect protein functional
+         groups, revealing specificity patterns in the perturbation data.
+  
+<<>>=
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)  # for column_to_rownames
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(RColorBrewer)
+  library(grid)
+  library(gridExtra)
+  library(scales)  # for percent_format
+})
+
+set.seed(42)
+
+# Gene filtering
+MIN_SIG_PROTEINS <- 3
+SIG_FDR_THRESHOLD <- 0.10
+
+# Gene clustering
+N_GENE_CLUSTERS <- 10
+
+# Visualization
+ZSCORE_CAP <- 3
+
+# Directories
+GENE_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+CORR_RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_correlation"
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/results/"
+
+#dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Color palettes
+protein_cluster_colors <- c(
+  "Activation" = "#d7aca1",
+  "Adhesion" = "#79ad41",
+  "Cytokine/Chemokine" = "#4063a3",
+  "Identity" = "#ddc000",
+  "Innate-like" = "#34b6c6"
+)
+
+gene_cluster_colors <- c(
+  "#a82203", "#208cc0", "#f1af3a", "#cf5e4e", "#637b31", 
+  "#003967", "#3b7c70", "#ce9642", "#898e9f", "#3b3a3e"
+)
+
+# SECTION 1: LOAD DATA
+
+# Load gene-level results
+gene_zscore_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_zscore_mat.rds"))
+gene_qval_mat <- readRDS(file.path(GENE_RESULTS_DIR, "gene_qval_per_protein.rds"))
+gene_ncells <- readRDS(file.path(GENE_RESULTS_DIR, "gene_ncells.rds"))
+self_targeted_gene <- readRDS(file.path(GENE_RESULTS_DIR, "self_targeted_gene.rds"))
+
+cat(sprintf("Gene Z-score matrix: %d genes × %d proteins\n",
+            nrow(gene_zscore_mat), ncol(gene_zscore_mat)))
+
+# Load protein cluster assignments
+prot_cluster_df <- readRDS(file.path(CORR_RESULTS_DIR, "prot_cluster_df_ntc.rds"))
+
+cat(sprintf("Protein clusters: %d proteins in %d groups\n",
+            nrow(prot_cluster_df), length(unique(prot_cluster_df$cluster_name))))
+
+cat("\nProtein group sizes:\n")
+print(table(prot_cluster_df$cluster_name))
+# Activation    Adhesion Cytokine/Chemokine      Identity        Innate-like 
+#        42           39                 39           24                 57 
+                
+# Create protein to cluster lookup
+protein_to_cluster <- setNames(prot_cluster_df$cluster_name, prot_cluster_df$protein)
+protein_groups <- c("Activation", "Adhesion", "Cytokine/Chemokine", "Identity", "Innate-like")
+@
+
+<<>>=
+# SECTION 2: LOAD PRE-COMPUTED GENE CLUSTERS
+# Load pre-computed gene clustering from functional clustering analysis
+gene_cluster_file <- "/home/ec2-user/scitoseq/results/gene_clustering_df.csv"
+cat(sprintf("Loading gene clusters from: %s\n", gene_cluster_file))
+
+gene_cluster_df <- read.csv(gene_cluster_file, stringsAsFactors = FALSE)
+
+# Clean up column names (remove the unnamed index column if present)
+if ("X" %in% colnames(gene_cluster_df)) {
+  gene_cluster_df$X <- NULL
+}
+if ("...1" %in% colnames(gene_cluster_df)) {
+  gene_cluster_df$...1 <- NULL
+}
+
+cat(sprintf("Loaded %d genes in %d clusters\n", 
+            nrow(gene_cluster_df), length(unique(gene_cluster_df$cluster))))
+
+# Update N_GENE_CLUSTERS based on actual data
+N_GENE_CLUSTERS <- length(unique(gene_cluster_df$cluster))
+
+# Create named vector of cluster assignments
+gene_clusters <- setNames(gene_cluster_df$cluster, gene_cluster_df$gene)
+genes_filtered <- gene_cluster_df$gene
+n_genes_filtered <- length(genes_filtered)
+
+cat("\nGene cluster sizes:\n")
+print(table(gene_clusters))
+# gene_clusters
+#  1  2  3  4  5  6  7  8  9 10 
+# 41 18 39 49 21 15 35 47 27  7 
+
+# Create masked Z-score matrix (remove self-targeted pairs)
+gene_zscore_masked <- gene_zscore_mat
+n_masked <- 0
+
+for (i in 1:nrow(self_targeted_gene)) {
+  gene <- self_targeted_gene$gene[i]
+  protein <- self_targeted_gene$protein[i]
+  if (gene %in% rownames(gene_zscore_masked) && protein %in% colnames(gene_zscore_masked)) {
+    gene_zscore_masked[gene, protein] <- NA
+    n_masked <- n_masked + 1
+  }
+}
+
+cat(sprintf("\nMasked %d on-target pairs\n", n_masked))
+
+# Prepare Z-score matrix for filtered genes
+zscore_for_clust <- gene_zscore_masked[genes_filtered, , drop = FALSE]
+@
+
+<<>>=
+# SECTION 3: SIMPLE CLUSTER ANNOTATIONS (based on dominant protein group effect)
+
+# For each gene cluster, find which protein group has the strongest effect
+cluster_annotations <- data.frame()
+
+for (cl in sort(unique(gene_clusters))) {
+  cluster_genes <- names(gene_clusters)[gene_clusters == cl]
+  cluster_zscore <- zscore_for_clust[cluster_genes, , drop = FALSE]
+  
+  # Calculate mean absolute Z-score per protein group
+  group_effects <- sapply(protein_groups, function(grp) {
+    group_proteins <- prot_cluster_df$protein[prot_cluster_df$cluster_name == grp]
+    group_proteins <- intersect(group_proteins, colnames(cluster_zscore))
+    if (length(group_proteins) == 0) return(NA)
+    mean(abs(cluster_zscore[, group_proteins, drop = FALSE]), na.rm = TRUE)
+  })
+  
+  # Calculate mean signed Z-score for direction
+  group_signed <- sapply(protein_groups, function(grp) {
+    group_proteins <- prot_cluster_df$protein[prot_cluster_df$cluster_name == grp]
+    group_proteins <- intersect(group_proteins, colnames(cluster_zscore))
+    if (length(group_proteins) == 0) return(NA)
+    mean(cluster_zscore[, group_proteins, drop = FALSE], na.rm = TRUE)
+  })
+  
+  dominant_group <- names(which.max(group_effects))
+  dominant_direction <- ifelse(group_signed[dominant_group] > 0, "↑", "↓")
+  
+  cluster_annotations <- rbind(cluster_annotations, data.frame(
+    cluster = cl,
+    n_genes = length(cluster_genes),
+    dominant_group = dominant_group,
+    dominant_effect = round(group_effects[dominant_group], 3),
+    dominant_direction = dominant_direction,
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Create simple annotation labels
+cluster_annotations$label <- paste0("C", cluster_annotations$cluster, " (n=", 
+                                    cluster_annotations$n_genes, ")")
+cluster_annotations$label_full <- paste0("C", cluster_annotations$cluster, ": ", 
+                                         cluster_annotations$dominant_group, " ",
+                                         cluster_annotations$dominant_direction)
+
+cat("Cluster Annotations:\n")
+print(cluster_annotations)
+
+# Create lookup
+cluster_label_lookup <- setNames(cluster_annotations$label, cluster_annotations$cluster)
+cluster_label_full_lookup <- setNames(cluster_annotations$label_full, cluster_annotations$cluster)
+@
+
+<<>>=
+# SECTION 4: COMPUTE SUMMARY STATISTICS
+
+# Create comprehensive summary for each gene cluster × protein group combination
+summary_stats <- data.frame()
+
+for (cl in sort(unique(gene_clusters))) {
+  cluster_genes <- names(gene_clusters)[gene_clusters == cl]
+  cluster_zscore <- zscore_for_clust[cluster_genes, , drop = FALSE]
+  cluster_qval <- gene_qval_mat[cluster_genes, , drop = FALSE]
+  
+  for (grp in protein_groups) {
+    group_proteins <- prot_cluster_df$protein[prot_cluster_df$cluster_name == grp]
+    group_proteins <- intersect(group_proteins, colnames(cluster_zscore))
+    
+    if (length(group_proteins) == 0) next
+    
+    # Extract submatrix
+    zscore_sub <- cluster_zscore[, group_proteins, drop = FALSE]
+    qval_sub <- cluster_qval[, group_proteins, drop = FALSE]
+    
+    # Calculate statistics
+    all_zscores <- as.vector(zscore_sub)
+    all_qvals <- as.vector(qval_sub)
+    
+    # Remove NA
+    valid_idx <- !is.na(all_zscores) & !is.na(all_qvals)
+    all_zscores <- all_zscores[valid_idx]
+    all_qvals <- all_qvals[valid_idx]
+    
+    n_total <- length(all_zscores)
+    n_sig <- sum(all_qvals < SIG_FDR_THRESHOLD)
+    
+    # Signed effects
+    sig_zscores <- all_zscores[all_qvals < SIG_FDR_THRESHOLD]
+    n_up <- sum(sig_zscores > 0, na.rm = TRUE)
+    n_down <- sum(sig_zscores < 0, na.rm = TRUE)
+    
+    summary_stats <- rbind(summary_stats, data.frame(
+      gene_cluster = cl,
+      protein_group = grp,
+      n_genes = length(cluster_genes),
+      n_proteins = length(group_proteins),
+      n_pairs_total = n_total,
+      n_pairs_sig = n_sig,
+      n_pairs_up = n_up,
+      n_pairs_down = n_down,
+      mean_zscore = mean(all_zscores, na.rm = TRUE),
+      mean_zscore_sig = ifelse(n_sig > 0, mean(sig_zscores, na.rm = TRUE), NA),
+      mean_abs_zscore = mean(abs(all_zscores), na.rm = TRUE),
+      sd_zscore = sd(all_zscores, na.rm = TRUE),
+      prop_sig = n_sig / n_total,
+      prop_up = ifelse(n_sig > 0, n_up / n_sig, NA),
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+cat(sprintf("Summary statistics: %d rows (10 clusters × 5 protein groups)\n", nrow(summary_stats)))
+
+# Add cluster labels
+summary_stats$cluster_label <- cluster_label_lookup[as.character(summary_stats$gene_cluster)]
+@
+
+<<>>=
+# SECTION 5: Main Heatmap - Mean Z-score (TRANSPOSED: Protein groups as rows)
+# Create matrix for heatmap (gene clusters as columns, protein groups as rows)
+zscore_matrix <- summary_stats %>%
+  dplyr::select(gene_cluster, protein_group, mean_zscore) %>%
+  pivot_wider(names_from = gene_cluster, values_from = mean_zscore) %>%
+  column_to_rownames("protein_group") %>% as.matrix()
+
+# Reorder rows to match protein_groups order, columns to be 1-10
+zscore_matrix <- zscore_matrix[protein_groups, as.character(1:N_GENE_CLUSTERS)]
+
+# Simple column labels: C1, C2, ..., C10
+col_labels <- paste0("C", 1:N_GENE_CLUSTERS)
+
+# Color scale
+zscore_colors <- colorRamp2(
+  c(-1.6, -1.2, -0.8, -0.4, 0, 0.4, 0.8, 1.2, 1.6),
+  c("#1e466e", "#376795", "#72bcd5", "#aadce0", "white","#ffd06f", "#f7aa58", "#ef8a47", "#e76254"))
+
+#"#e76254", "#ef8a47", "#f7aa58", "#ffd06f", "#ffe6b7", "#aadce0", "#72bcd5", "#528fad", "#376795", "#1e466e" # Hiroshige
+
+# Row annotation: color bar to the RIGHT of text labels (but left of heatmap)
+# Order: [text] [color bar] [heatmap]
+row_anno <- rowAnnotation(
+  Group = protein_groups,
+  col = list(Group = protein_cluster_colors),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(4, "mm"),
+  show_legend = FALSE
+)
+
+# Bottom annotation: color bar + text labels for gene clusters
+bottom_anno <- HeatmapAnnotation(
+  Cluster = factor(1:N_GENE_CLUSTERS, levels = 1:N_GENE_CLUSTERS),
+  Label = anno_text(col_labels, rot = 0, gp = gpar(fontsize = 12), location = 0.5, just = "center", 
+                    height = unit(8, "mm")), #  # More space below color bar
+  col = list(Cluster = setNames(gene_cluster_colors[1:N_GENE_CLUSTERS], 1:N_GENE_CLUSTERS)),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(5, "mm"),
+  show_legend = FALSE,
+  which = "column"
+)
+
+cat("Generating main heatmap (transposed)...\n")
+
+pdf(file.path("/home/ec2-user/scitoseq/fig/fig2/", "heatmap_mean_zscore_transposed.pdf"), width = 9, height = 5)
+
+ht_main <- Heatmap(
+  zscore_matrix,
+  name = "Mean\nZ-score",
+  col = zscore_colors,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  # Row labels (protein groups) - text on the left
+  row_labels = protein_groups,
+  row_names_gp = gpar(fontsize = 11),
+  row_names_side = "left",
+  
+  # Row annotation (color bar) - between text and heatmap
+  left_annotation = row_anno,
+  
+  # No column names on top - we use bottom annotation instead
+  show_column_names = FALSE,
+  
+  # Bottom annotation: color bar + text labels
+  bottom_annotation = bottom_anno,
+  
+  # Cell values
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(sprintf("%.2f", zscore_matrix[i, j]), x, y, 
+              gp = gpar(fontsize = 12, col = ifelse(abs(zscore_matrix[i, j]) > 1, "white", "black")))
+  },
+  
+  column_title = "Mean Perturbation Z-score by Gene Cluster",
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  
+  heatmap_legend_param = list(
+    title = "Mean\nZ-score",
+    at = c(-1.6, -1.2, -0.8, -0.4, 0, 0.4, 0.8, 1.2, 1.6),#c(-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2),#c(-0.3, -0.15, 0, 0.15, 0.3),
+    legend_height = unit(3, "cm"),
+    title_gp = gpar(fontsize = 10, fontface = "bold")
+  ),
+  
+  width = unit(15, "cm"),
+  height = unit(8, "cm"),
+  
+  border = TRUE,
+  rect_gp = gpar(col = "gray70", lwd = 0.5)
+)
+
+draw(ht_main, heatmap_legend_side = "right")
+dev.off()
+
+# PNG version
+#png(file.path(OUTPUT_DIR, "heatmap_mean_zscore_transposed.png"), 
+#    width = 9, height = 5, units = "in", res = 300)
+#draw(ht_main, heatmap_legend_side = "right")
+#dev.off()
+@
+
+\end{document}

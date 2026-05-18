@@ -1,0 +1,914 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+Semi-NMF Network: Restructured Gene Selection + Network Plot
+
+Three-category gene selection:
+  Category 1: Module-defining (top activators/repressors per module)
+  Category 2: Module-specific (single-module, high specificity)
+  Category 3: Opposing-effect (multi-module, signed transitions)
+  
+<<>>=
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(ggnewscale)
+})
+
+# 1. PARAMETERS
+INPUT_DIR  <- "/home/ec2-user/scitoseq/results/semiNMF_v1_analysis"
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/fig/fig3/"
+
+# --- Threshold ---
+W_THRESHOLD_PERCENTILE <- 0.90
+
+# --- Selection counts ---
+N_MODULE_DEFINING  <- 50   # top activators + repressors per module (each side)
+N_MODULE_SPECIFIC  <- 10    # highest-specificity single-module genes per module
+N_OPPOSING         <- 100   # total opposing-effect genes (across all module pairs)
+
+# --- Protein display ---
+PROTEIN_SPECIFICITY_MIN <- 1.5
+N_PROTEINS_MAX          <- 6
+
+# --- Highlight lists ---
+# Genes with established T cell / immune literature (from audit)
+IMMUNE_GENES <- c(
+  # Known immune regulators from original list
+  "IL2RA", "IL2RB", "IL15RA", "IL12B",
+  "PDCD1", "CTLA4", "LAG3", "ICOS",
+  "CD28", "CD27", "CD40LG", "TNFRSF4", "TNFRSF1B", "TNFRSF1A", # "TNFRSF9", 
+  "CARD11", "NFKB1", "RELA",
+  "PRDM1", "STAT5A",
+  "GZMA", "FASLG",
+  "CXCR3", "CXCR4",
+  "S1PR1", "PTPN6", "MAP3K8",
+  # Literature-supported from audit
+  "CD244", "CD69", "STX11", "GNAI2", "SORT1",
+  "CSF2", "LYN", "PECAM1", "RIPOR1",
+  "TAB2", "CASP6", "CTSC", "PSTPIP1",
+  "IL17RA", "ALOX5AP", "SIRPA", "MAP2K2",
+  "MYLIP", "SLPI", "CD19"
+)
+
+# Novel candidates (high specificity, limited T cell literature)
+NOVEL_HIGHLIGHT <- c(
+  "SALL2", "RAP1GDS1", "KCNJ18", "TBL3",
+  "CCDC134", "NUFIP1", "PHF8", "CNTN2",
+  "HVCN1", "EPHA4", "EFNA4", "LAPTM5",
+  "SATB2", "PRKACB", "MZF1", "FJX1",
+  "NOP58", "CTBS"
+)
+
+# --- Visual parameters ---
+EDGE_COLORS <- c(
+  "activating"  = "#C0392B",
+  "repressing"  = "#2471A3"
+)
+IMMUNE_LABEL_COLOR <- "#6D1A36"
+NOVEL_LABEL_COLOR  <- "#00796B"
+
+MODULE_NAMES <- c(
+  "M1" = "Adhesion &\nImmune Regulation",
+  "M2" = "Tissue Interaction\n/ Innate-like",
+  "M3" = "Resting / Naive",
+  "M4" = "Activation\n/ Proliferation",
+  "M5" = "Effector\n/ Exhaustion"
+)
+MODULE_COLORS <- c(
+  "M1" = "#da7901",
+  "M2" = "#20235b",
+  "M3" = "#637b31",
+  "M4" = "#7B2D8E",
+  "M5" = "#f0be3d"
+)
+CAT_SHAPES <- c(
+  "activator"  = 24,
+  "repressor"  = 25,
+  "opposing"   = 23
+)
+CAT_FILLS <- c(
+  "activator"  = "white",
+  "repressor"  = "white",
+  "opposing"   = "white"
+)
+CAT_LABELS <- c(
+  "activator"  = "Module activator",
+  "repressor"  = "Module repressor",
+  "opposing"   = "Opposing effects"
+)
+
+
+# 2. LOAD AND NORMALIZE
+model_k5 <- readRDS(file.path(INPUT_DIR, "model_k5.rds"))
+W_raw <- model_k5$W
+H_raw <- model_k5$H
+modules <- paste0("M", 1:5)
+colnames(W_raw) <- modules
+rownames(H_raw) <- modules
+
+# L2-normalize columns of W, scale H accordingly
+d <- sqrt(colSums(W_raw^2))
+W <- sweep(W_raw, 2, d, "/")
+H <- diag(d) %*% H_raw
+rownames(H) <- modules
+colnames(H) <- colnames(H_raw)
+
+cat(sprintf("W: %d genes x %d modules\n", nrow(W), ncol(W)))
+cat(sprintf("H: %d modules x %d proteins\n", nrow(H), ncol(H)))
+# W: 2848 genes x 5 modules
+# H: 5 modules x 201 proteins
+
+# --- Threshold ---
+w_abs_all <- abs(as.vector(W))
+W_STRONG  <- quantile(w_abs_all, probs = W_THRESHOLD_PERCENTILE)
+cat(sprintf("Edge threshold: %.5f (%.0f%% percentile of |W|)\n",
+            W_STRONG, W_THRESHOLD_PERCENTILE * 100))
+# Edge threshold: 0.03072 (90% percentile of |W|)
+@
+
+<<>>=
+# 3. GENE-LEVEL ANNOTATIONS (computed once, used by all categories)
+gene_ann <- data.frame(
+  gene        = rownames(W),
+  is_immune   = rownames(W) %in% IMMUNE_GENES,
+  is_novel    = rownames(W) %in% NOVEL_HIGHLIGHT,
+  stringsAsFactors = FALSE
+)
+
+# Per-gene summary statistics
+gene_ann$max_abs       <- apply(abs(W), 1, max)
+gene_ann$max_pos       <- apply(W, 1, max)
+gene_ann$max_neg       <- apply(W, 1, min)
+gene_ann$n_strong_pos  <- rowSums(W >=  W_STRONG)
+gene_ann$n_strong_neg  <- rowSums(W <= -W_STRONG)
+gene_ann$n_strong_any  <- gene_ann$n_strong_pos + gene_ann$n_strong_neg
+
+# Primary module (largest |W|)
+gene_ann$primary_module <- colnames(W)[apply(abs(W), 1, which.max)]
+gene_ann$primary_weight <- sapply(seq_len(nrow(W)), function(i) {
+  W[i, gene_ann$primary_module[i]]
+})
+gene_ann$primary_abs <- abs(gene_ann$primary_weight)
+
+# Secondary module (largest |W| among remaining, if above threshold)
+gene_ann$secondary_module <- sapply(seq_len(nrow(W)), function(i) {
+  w <- abs(W[i, ])
+  w[gene_ann$primary_module[i]] <- 0
+  if (max(w) >= W_STRONG) colnames(W)[which.max(w)] else NA_character_
+})
+gene_ann$secondary_weight <- sapply(seq_len(nrow(W)), function(i) {
+  sm <- gene_ann$secondary_module[i]
+  if (!is.na(sm)) W[i, sm] else NA_real_
+})
+
+# Category assignment
+gene_ann$category <- case_when(
+  gene_ann$n_strong_pos >= 1 & gene_ann$n_strong_neg >= 1 ~ "opposing",
+  gene_ann$max_pos >=  W_STRONG                           ~ "activator",
+  gene_ann$max_neg <= -W_STRONG                           ~ "repressor",
+  TRUE                                                    ~ "weak"
+)
+
+cat("\nGene classification summary:\n")
+print(table(gene_ann$category))
+#activator  opposing repressor      weak 
+#      378       266       420      1784 
+@
+
+The 2,848 genes in W are the significant gene set from your Welch t-tests. 
+The 90th percentile threshold (|W| ≥ 0.03072) is applied to all 14,240 gene-module pairs (2,848 × 5). For each gene, we then ask: does it have any positive loading above threshold? 
+
+378 activators (13.3\%): at least one module positive above threshold, none negative below
+420 repressors (14.7\%): at least one module negative below threshold, none positive above
+266 opposing (9.3\%): at least one positive AND at least one negative above threshold
+1,784 weak (62.6\%): no module reaches threshold in either direction
+
+-> 1,064 genes (37.4\%) have at least one significant module association
+
+<<>>=
+# 4. THREE-CATEGORY GENE SELECTION
+
+# ---- Category 1: Module-defining (top N per module, per direction) ----
+#
+# For each module, rank genes by their W value in that module.
+# Take top activators (most positive) and top repressors (most negative).
+# No specificity requirement -- these define what each module IS.
+
+cat("\n=== Category 1: Module-defining genes ===\n")
+cat1_list <- list()
+for (m in modules) {
+  w_col <- W[, m]
+  
+  # Activators: positive W above threshold, ranked by W
+  act_idx <- which(w_col >= W_STRONG)
+  act_idx <- act_idx[order(w_col[act_idx], decreasing = TRUE)]
+  act_idx <- head(act_idx, N_MODULE_DEFINING)
+  
+  # Repressors: negative W below -threshold, ranked by W (most negative first)
+  rep_idx <- which(w_col <= -W_STRONG)
+  rep_idx <- rep_idx[order(w_col[rep_idx])]
+  rep_idx <- head(rep_idx, N_MODULE_DEFINING)
+  
+  cat1_list[[m]] <- data.frame(
+    gene   = rownames(W)[c(act_idx, rep_idx)],
+    module = m,
+    role   = c(rep("activator", length(act_idx)),
+               rep("repressor", length(rep_idx))),
+    w_value = w_col[c(act_idx, rep_idx)],
+    selection = "module_defining",
+    stringsAsFactors = FALSE
+  )
+  cat(sprintf("  %s: %d activators, %d repressors\n",
+              m, length(act_idx), length(rep_idx)))
+}
+cat1 <- bind_rows(cat1_list)
+cat(sprintf("  Total module-defining gene-module pairs: %d\n", nrow(cat1)))
+cat(sprintf("  Unique genes: %d\n", n_distinct(cat1$gene)))
+# Total module-defining gene-module pairs: 466
+# Unique genes: 407
+
+# ---- Category 2: Module-specific (single-module, high specificity) ----
+#
+# Among genes with max|W| >= threshold, select those where ONLY ONE
+# module passes threshold. Rank by |W| (not by specificity ratio, which
+# is noisy). These are clean, unambiguous examples.
+
+cat("\n=== Category 2: Module-specific genes ===\n")
+
+specific_genes <- gene_ann %>%
+  filter(category %in% c("activator", "repressor"),
+         n_strong_any == 1) %>%            # exactly one module above threshold
+  arrange(desc(primary_abs))
+
+cat2_list <- list()
+for (m in modules) {
+  m_genes <- specific_genes %>%
+    filter(primary_module == m) %>%
+    head(N_MODULE_SPECIFIC)
+  
+  if (nrow(m_genes) > 0) {
+    cat2_list[[m]] <- data.frame(
+      gene      = m_genes$gene,
+      module    = m,
+      role      = ifelse(m_genes$primary_weight > 0, "activator", "repressor"),
+      w_value   = m_genes$primary_weight,
+      selection = "module_specific",
+      stringsAsFactors = FALSE
+    )
+  }
+  cat(sprintf("  %s: %d genes (top |W|: %.4f)\n",
+              m, nrow(m_genes),
+              ifelse(nrow(m_genes) > 0, max(m_genes$primary_abs), 0)))
+}
+cat2 <- bind_rows(cat2_list)
+cat(sprintf("  Total module-specific genes: %d\n", nrow(cat2)))
+  # M1: 10 genes (top |W|: 0.0532)
+  # M2: 10 genes (top |W|: 0.0699)
+  # M3: 10 genes (top |W|: 0.0574)
+  # M4: 10 genes (top |W|: 0.0590)
+  # M5: 10 genes (top |W|: 0.0582)
+#   Total module-specific genes: 50
+
+# ---- Category 3: Opposing-effect genes (multi-module transitions) ----
+#
+# Genes with significant loadings (above threshold) in >= 2 modules with
+# opposite signs. Scored by:
+#   opposing_score = |strongest_positive| * |strongest_negative|
+# This naturally selects genes that are simultaneously strong activators
+# of one program and strong repressors of another.
+
+cat("\n=== Category 3: Opposing-effect genes ===\n")
+
+opposing_genes <- gene_ann %>%
+  filter(category == "opposing") %>%
+  mutate(
+    # strongest positive and negative loadings
+    best_pos = max_pos,
+    best_neg = max_neg,
+    # opposing score: product of magnitudes
+    opposing_score = abs(best_pos) * abs(best_neg),
+    # range across modules (alternative ranking)
+    w_range = best_pos - best_neg
+  ) %>%
+  arrange(desc(opposing_score)) %>%
+  head(N_OPPOSING)
+
+# Identify the activated and repressed modules for each
+opposing_genes$act_module <- sapply(opposing_genes$gene, function(g) {
+  w <- W[g, ]
+  strong_pos <- which(w >= W_STRONG)
+  if (length(strong_pos) > 0) {
+    names(which.max(w[strong_pos]))
+  } else NA_character_
+})
+opposing_genes$rep_module <- sapply(opposing_genes$gene, function(g) {
+  w <- W[g, ]
+  strong_neg <- which(w <= -W_STRONG)
+  if (length(strong_neg) > 0) {
+    names(which.min(w[strong_neg]))
+  } else NA_character_
+})
+
+cat3 <- data.frame(
+  gene      = opposing_genes$gene,
+  module    = opposing_genes$primary_module,
+  role      = "opposing",
+  w_value   = opposing_genes$primary_weight,
+  selection = "opposing",
+  stringsAsFactors = FALSE
+)
+
+cat(sprintf("  Total opposing genes: %d\n", nrow(cat3)))
+cat(sprintf("  Score range: %.6f to %.6f\n",
+            min(opposing_genes$opposing_score),
+            max(opposing_genes$opposing_score)))
+# Score range: 0.001681 to 0.010684
+
+# Print top opposing genes
+cat("\n  Top 100 opposing genes (by |pos| * |neg|):\n")
+cat(sprintf("  %-12s %8s %8s %8s %8s %8s  pos→  neg→  score\n",
+            "Gene", "M1", "M2", "M3", "M4", "M5"))
+cat(paste(rep("-", 90), collapse = ""), "\n")
+for (i in 1:min(100, nrow(opposing_genes))) {
+  g <- opposing_genes$gene[i]
+  cat(sprintf("  %-12s %+.4f %+.4f %+.4f %+.4f %+.4f  %s  %s  %.5f\n",
+              g, W[g, 1], W[g, 2], W[g, 3], W[g, 4], W[g, 5],
+              opposing_genes$act_module[i],
+              opposing_genes$rep_module[i],
+              opposing_genes$opposing_score[i]))
+}
+
+# Summary of module-pair transitions
+cat("\n  Opposing gene module-pair summary:\n")
+transition_tab <- table(
+  paste0(opposing_genes$act_module, "+"),
+  paste0(opposing_genes$rep_module, "-")
+)
+print(transition_tab)
+@
+      M1- M2- M3- M4- M5-
+  M1+   0   0  19   1   4
+  M2+  11   0   1   0  21
+  M3+   4   0   0   0   4
+  M4+  10   1   5   0  18
+  M5+   0   1   0   0   0
+
+<<>>=
+# 5. MERGE SELECTIONS
+all_selected <- bind_rows(cat1, cat2, cat3) %>%
+  distinct(gene, .keep_all = TRUE)
+
+# Ensure immune/novel genes that pass threshold are included
+must_include <- gene_ann %>%
+  filter((is_immune | is_novel),
+         category != "weak",
+         !(gene %in% all_selected$gene))
+
+if (nrow(must_include) > 0) {
+  must_df <- data.frame(
+    gene      = must_include$gene,
+    module    = must_include$primary_module,
+    role      = must_include$category,
+    w_value   = must_include$primary_weight,
+    selection = "must_include",
+    stringsAsFactors = FALSE
+  )
+  all_selected <- bind_rows(all_selected, must_df)
+  cat(sprintf("\nAdded %d must-include immune/novel genes\n", nrow(must_df)))
+}
+
+# Merge back full annotation
+selected <- gene_ann %>%
+  filter(gene %in% all_selected$gene) %>%
+  left_join(
+    all_selected %>% select(gene, selection) %>% distinct(gene, .keep_all = TRUE),
+    by = "gene"
+  )
+
+cat(sprintf("\n=== Final selection: %d unique genes ===\n", nrow(selected)))
+cat(sprintf("  Module-defining: %d\n",
+            sum(selected$selection == "module_defining", na.rm = TRUE)))
+cat(sprintf("  Module-specific: %d\n",
+            sum(selected$selection == "module_specific", na.rm = TRUE)))
+cat(sprintf("  Opposing:        %d\n",
+            sum(selected$selection == "opposing", na.rm = TRUE)))
+cat(sprintf("  Must-include:    %d\n",
+            sum(selected$selection == "must_include", na.rm = TRUE)))
+cat(sprintf("  Immune genes:    %d\n", sum(selected$is_immune)))
+cat(sprintf("  Novel genes:     %d\n", sum(selected$is_novel)))
+cat(sprintf("  Category breakdown:\n"))
+print(table(selected$category))
+@
+
+=== Final selection: 430 unique genes ===
+Module-defining: 407
+ Module-specific: 0
+ Opposing:        4
+ Must-include:    19
+ Immune genes:    36
+ Novel genes:     17
+ Category breakdown:
+ activator  opposing repressor 
+      117       158       155 
+      
+<<>>=
+# 6. MODULE POSITIONS (correlation-informed pentagon)
+module_radius <- 15
+pentagon_angles <- seq(pi/2, pi/2 + 2*pi, length.out = 6)[1:5]
+
+# Place anti-correlated modules maximally apart
+module_to_pos <- c("M4" = 1, "M1" = 2, "M5" = 3, "M3" = 4, "M2" = 5)
+module_angles <- setNames(pentagon_angles[module_to_pos], names(module_to_pos))
+
+module_pos <- data.frame(
+  name    = modules,
+  x       = cos(module_angles[modules]) * module_radius,
+  y       = sin(module_angles[modules]) * module_radius,
+  angle   = module_angles[modules],
+  name_x  = cos(module_angles[modules]) * (module_radius + 3.0),
+  name_y  = sin(module_angles[modules]) * (module_radius + 3.0),
+  stringsAsFactors = FALSE
+)
+
+# 7. POSITION GUIDES
+apply_repulsion <- function(df, iterations = 100, min_dist = 0.45, strength = 0.1) {
+  n <- nrow(df)
+  if (n < 2) return(df)
+  for (iter in seq_len(iterations)) {
+    for (i in 1:(n - 1)) {
+      for (j in (i + 1):n) {
+        dx   <- df$x[j] - df$x[i]
+        dy   <- df$y[j] - df$y[i]
+        dist <- sqrt(dx^2 + dy^2)
+        if (dist < min_dist && dist > 0.01) {
+          force <- strength * (min_dist - dist) / dist
+          df$x[i] <- df$x[i] - dx * force
+          df$y[i] <- df$y[i] - dy * force
+          df$x[j] <- df$x[j] + dx * force
+          df$y[j] <- df$y[j] + dy * force
+        }
+      }
+    }
+  }
+  df
+}
+
+position_guides <- function(guide_df, module_pos, W, w_strong, seed = 42) {
+  set.seed(seed)
+  n_modules    <- nrow(module_pos)
+  sector_width <- 2 * pi / n_modules
+  m_radius     <- max(sqrt(module_pos$x^2 + module_pos$y^2))
+
+  r_near_module <- m_radius - 2.5
+  r_near_center <- 5
+
+  guide_df$x <- NA_real_
+  guide_df$y <- NA_real_
+
+  passing_abs <- guide_df$primary_abs[guide_df$primary_abs >= w_strong]
+  w_min <- min(passing_abs, na.rm = TRUE)
+  w_max <- max(passing_abs, na.rm = TRUE)
+
+  for (i in seq_len(nrow(guide_df))) {
+    cat_i    <- guide_df$category[i]
+    primary  <- guide_df$primary_module[i]
+    secondary <- guide_df$secondary_module[i]
+    pw       <- guide_df$primary_abs[i]
+    primary_angle <- module_pos$angle[module_pos$name == primary]
+
+    if (w_max > w_min) {
+      base_radius <- r_near_center +
+        (pw - w_min) / (w_max - w_min) * (r_near_module - r_near_center)
+    } else {
+      base_radius <- (r_near_center + r_near_module) / 2
+    }
+
+    if (cat_i %in% c("activator", "repressor")) {
+      angle_offset <- runif(1, -sector_width * 0.35, sector_width * 0.35)
+      radius <- base_radius + runif(1, -0.2, 0.2)
+      guide_df$x[i] <- cos(primary_angle + angle_offset) * radius
+      guide_df$y[i] <- sin(primary_angle + angle_offset) * radius
+
+    } else if (cat_i == "opposing" && !is.na(secondary)) {
+      secondary_angle <- module_pos$angle[module_pos$name == secondary]
+      angle_diff <- secondary_angle - primary_angle
+      if (abs(angle_diff) > pi) angle_diff <- angle_diff - sign(angle_diff) * 2 * pi
+      mid_angle <- primary_angle + angle_diff * runif(1, 0.35, 0.65)
+      radius <- (r_near_center + r_near_module) / 2 + runif(1, -0.5, 0.5)
+      guide_df$x[i] <- cos(mid_angle) * radius
+      guide_df$y[i] <- sin(mid_angle) * radius
+
+    } else {
+      angle_offset <- runif(1, -sector_width * 0.3, sector_width * 0.3)
+      radius <- base_radius + runif(1, -0.2, 0.2)
+      guide_df$x[i] <- cos(primary_angle + angle_offset) * radius
+      guide_df$y[i] <- sin(primary_angle + angle_offset) * radius
+    }
+  }
+
+  guide_df <- apply_repulsion(guide_df, iterations = 100, min_dist = 0.45)
+  guide_df
+}
+
+cat("Positioning guides...\n")
+selected <- position_guides(selected, module_pos, W, W_STRONG)
+
+
+# 8. CREATE EDGES
+create_edges <- function(guide_df, W, module_pos, w_strong) {
+  edges_list <- vector("list", nrow(guide_df) * ncol(W))
+  idx <- 0
+  for (i in seq_len(nrow(guide_df))) {
+    g  <- guide_df$guide[i]
+    gx <- guide_df$x[i]
+    gy <- guide_df$y[i]
+    w  <- W[g, ]
+    for (m in colnames(W)) {
+      if (abs(w[m]) >= w_strong) {
+        idx <- idx + 1
+        edges_list[[idx]] <- data.frame(
+          guide     = g,
+          module    = m,
+          x1 = gx, y1 = gy,
+          x2 = module_pos$x[module_pos$name == m],
+          y2 = module_pos$y[module_pos$name == m],
+          weight    = w[m],
+          direction = ifelse(w[m] > 0, "activating", "repressing"),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  do.call(rbind, edges_list[seq_len(idx)])
+}
+
+# Note: guide_df uses column "gene", edges function expects "guide"
+selected$guide <- selected$gene
+
+cat("Creating edges...\n")
+edges <- create_edges(selected, W, module_pos, W_STRONG)
+cat(sprintf("Created %d edges (%d activating, %d repressing)\n",
+            nrow(edges), sum(edges$direction == "activating"),
+            sum(edges$direction == "repressing")))
+
+
+# 9. PROTEIN POSITIONS
+prot_max     <- apply(H, 2, max)
+prot_primary <- modules[apply(H, 2, which.max)]
+prot_second  <- apply(H, 2, function(x) sort(x, decreasing = TRUE)[2])
+prot_spec    <- prot_max / pmax(prot_second, 1e-10)
+
+get_protein_positions <- function(H, module_pos, prot_spec, prot_primary,
+                                  spec_min = 1.5, n_max = 6,
+                                  radial_offset = 2.3) {
+  out <- list()
+  for (m in rownames(H)) {
+    mx      <- module_pos$x[module_pos$name == m]
+    my      <- module_pos$y[module_pos$name == m]
+    m_angle <- module_pos$angle[module_pos$name == m]
+
+    all_m_prots <- which(prot_primary == m)
+    n_total     <- length(all_m_prots)
+
+    m_prots_idx <- which(prot_primary == m & prot_spec >= spec_min)
+    if (length(m_prots_idx) == 0) {
+      m_prots_idx <- all_m_prots
+      m_prots_idx <- m_prots_idx[order(H[m, m_prots_idx], decreasing = TRUE)]
+      m_prots_idx <- head(m_prots_idx, 3)
+    } else {
+      m_prots_idx <- m_prots_idx[order(prot_spec[m_prots_idx], decreasing = TRUE)]
+      m_prots_idx <- head(m_prots_idx, n_max)
+    }
+
+    k <- length(m_prots_idx)
+    if (k == 0) next
+
+    prots      <- colnames(H)[m_prots_idx]
+    label_text <- paste(prots, collapse = "\n")
+    n_remaining <- n_total - k
+    if (n_remaining > 0) {
+      label_text <- paste0(label_text, sprintf("\n+%d more", n_remaining))
+    }
+
+    urx <- cos(m_angle); ury <- sin(m_angle)
+    x <- mx + urx * radial_offset
+    y <- my + ury * radial_offset
+    hjust <- ifelse(abs(urx) < 0.15, 0.5, ifelse(urx > 0, 0, 1))
+
+    out[[m]] <- data.frame(
+      module = m, label = label_text,
+      x = x, y = y, hjust = hjust,
+      n_shown = k, n_total = n_total,
+      stringsAsFactors = FALSE
+    )
+  }
+  do.call(rbind, out)
+}
+
+protein_df <- get_protein_positions(
+  H, module_pos, prot_spec, prot_primary,
+  spec_min = PROTEIN_SPECIFICITY_MIN,
+  n_max    = N_PROTEINS_MAX,
+  radial_offset = 2.3
+)
+
+# Manual adjustment for M4 label position
+m4_row <- which(protein_df$module == "M4")
+if (length(m4_row) > 0) {
+  m4_mx <- module_pos$x[module_pos$name == "M4"]
+  m4_my <- module_pos$y[module_pos$name == "M4"]
+  protein_df$x[m4_row]     <- m4_mx + 2.5
+  protein_df$y[m4_row]     <- m4_my - 0.6
+  protein_df$hjust[m4_row] <- 0
+}
+@
+
+<<>>=
+# 10. MAIN NETWORK PLOT
+plot_network <- function(
+    guide_df, edges, module_pos,
+    protein_df      = NULL,
+    show_proteins   = FALSE,
+    show_all_labels = FALSE,
+    highlight_novel = TRUE,
+    title    = NULL,
+    subtitle = NULL
+) {
+
+  edges$direction <- factor(edges$direction, levels = c("activating", "repressing"))
+
+  p <- ggplot()
+
+  # --- Edges ---
+  edges_act <- edges[edges$direction == "activating", ]
+  edges_rep <- edges[edges$direction == "repressing", ]
+  edge_lw <- 0.6
+
+  if (nrow(edges_act) > 0) {
+    p <- p + geom_curve(
+        data = edges_act,
+        aes(x = x1, y = y1, xend = x2, yend = y2),
+        color = EDGE_COLORS["activating"],
+        linewidth = edge_lw, alpha = 0.45, curvature = 0.2)
+  }
+  if (nrow(edges_rep) > 0) {
+    p <- p +
+      geom_curve(
+        data = edges_rep,
+        aes(x = x1, y = y1, xend = x2, yend = y2),
+        color = EDGE_COLORS["repressing"],
+        linewidth = edge_lw, alpha = 0.45, curvature = 0.2
+      )
+  }
+
+  # --- Proteins ---
+  if (show_proteins && !is.null(protein_df)) {
+    for (i in seq_len(nrow(protein_df))) {
+      m <- protein_df$module[i]
+      p <- p +
+        geom_label(
+          data = protein_df[i, , drop = FALSE],
+          aes(x = x, y = y, label = label),
+          hjust         = protein_df$hjust[i],
+          size          = 2.6,
+          color         = MODULE_COLORS[m],
+          fill          = "gray97",
+          label.size    = 0.3,
+          label.r       = unit(0.15, "lines"),
+          label.padding = unit(0.25, "lines"),
+          lineheight    = 0.9,
+          fontface      = "bold"
+        )
+    }
+  }
+
+  # --- Module nodes ---
+  for (m in module_pos$name) {
+    m_data <- module_pos[module_pos$name == m, ]
+    p <- p +
+      geom_point(data = m_data, aes(x = x, y = y),
+                 size = 18, shape = 21,
+                 fill = MODULE_COLORS[m], color = "white", stroke = 2.5)
+  }
+  p <- p +
+    geom_text(data = module_pos,
+              aes(x = x, y = y, label = name),
+              color = "white", size = 5.5, fontface = "bold")
+
+  # --- Guide nodes: three visual tiers ---
+  guide_df$category <- factor(guide_df$category, levels = names(CAT_SHAPES))
+
+  # Tier 1: Regular (background)
+  regular <- guide_df[!guide_df$is_immune & !guide_df$is_novel, ]
+  if (nrow(regular) > 0) {
+    p <- p +
+      geom_point(data = regular,
+                 aes(x = x, y = y, shape = category, fill = category),
+                 size = 1.5, color = "gray40", stroke = 0.6)
+  }
+
+  # Tier 2: Novel
+  if (highlight_novel) {
+    novel <- guide_df[guide_df$is_novel & !guide_df$is_immune, ]
+    if (nrow(novel) > 0) {
+      p <- p +
+        geom_point(data = novel,
+                   aes(x = x, y = y, shape = category, fill = category),
+                   size = 2.2, color = NOVEL_LABEL_COLOR, stroke = 1.2)
+    }
+  }
+
+  # Tier 3: Immune (foreground)
+  immune <- guide_df[guide_df$is_immune, ]
+  if (nrow(immune) > 0) {
+    p <- p +
+      geom_point(data = immune,
+                 aes(x = x, y = y, shape = category, fill = category),
+                 size = 2.5, color = IMMUNE_LABEL_COLOR, stroke = 1.4)
+  }
+
+  p <- p +
+    scale_shape_manual(values = CAT_SHAPES, labels = CAT_LABELS,
+                       name = "Gene type", drop = FALSE) +
+    scale_fill_manual(values = CAT_FILLS, labels = CAT_LABELS,
+                      name = "Gene type", drop = FALSE)
+
+  # --- Labels: immune + novel only ---
+  if (show_all_labels) {
+    label_data <- guide_df
+  } else {
+    label_data <- guide_df[guide_df$is_immune | guide_df$is_novel, ]
+  }
+
+  if (nrow(label_data) > 0) {
+    label_colors <- ifelse(label_data$is_immune, IMMUNE_LABEL_COLOR,
+                    ifelse(label_data$is_novel, NOVEL_LABEL_COLOR, "gray40"))
+    label_face <- ifelse(label_data$is_immune | label_data$is_novel,
+                         "bold", "plain")
+
+    p <- p +
+      geom_text_repel(
+        data = label_data,
+        aes(x = x, y = y, label = guide),
+        size          = 2.8,
+        fontface      = label_face,
+        color         = label_colors,
+        bg.color      = "white",
+        bg.r          = 0.15,
+        max.overlaps  = 60,
+        segment.color = "gray60",
+        segment.size  = 0.25,
+        box.padding   = 0.4,
+        point.padding = 0.3,
+        force         = 3,
+        seed          = 42
+      )
+  }
+
+  # --- Legend: Edge direction ---
+  edge_legend_df <- data.frame(
+    x = c(Inf, Inf), y = c(Inf, Inf),
+    direction = factor(c("activating", "repressing"),
+                       levels = c("activating", "repressing")))
+  p <- p +
+    geom_segment(
+      data = edge_legend_df,
+      aes(x = x, y = y, xend = x, yend = y, color = direction),
+      linewidth = 0.8, alpha = 1) + scale_color_manual(
+      name   = "Edge direction",
+      values = EDGE_COLORS,
+      labels = c("activating" = "Activating", "repressing" = "Repressing"),
+      guide  = guide_legend(
+        order = 1, nrow = 1, title.position = "left",
+        override.aes = list(linewidth = 2.5, alpha = 1)))
+
+  # --- Legend: Module identity ---
+  module_legend_df <- data.frame(
+    x = rep(Inf, length(modules)),
+    y = rep(Inf, length(modules)),
+    module_id = factor(modules, levels = modules))
+  p <- p + geom_point(
+      data = module_legend_df,
+      aes(x = x, y = y, size = module_id),
+      shape = 21, fill = NA, color = NA, stroke = 0) +
+    scale_size_manual(
+      name   = "Module",
+      values = setNames(rep(5, length(modules)), modules),
+      labels = setNames(gsub("\n", " ", MODULE_NAMES[modules]), modules),
+      guide  = guide_legend(
+        order = 2, nrow = 2, title.position = "left",
+        override.aes = list(
+          shape = 21, fill  = unname(MODULE_COLORS[modules]),
+          color = "white", stroke = 1.5, size = 5)))
+
+  # --- Legend: Gene annotation color ---
+  p <- p + new_scale_color() +
+    geom_point(
+      data = data.frame(
+        x = c(Inf, Inf), y = c(Inf, Inf),
+        #gene_type = factor(c("Validated immune", "Candidate novel"),
+        #                   levels = c("Validated immune", "Candidate novel"))),
+        gene_type = factor(c("known regulator", "newly identified regulator"),
+                          levels = c("known regulator", "newly identified regulator"))),
+      aes(x = x, y = y, color = gene_type),
+      size = 3
+    ) +
+    scale_color_manual(
+      name   = "",
+      values = c("known regulator" = IMMUNE_LABEL_COLOR,
+                 "newly identified regulator"  = NOVEL_LABEL_COLOR),
+      guide  = guide_legend(
+        order = 4, nrow = 1, title.position = "left",
+        override.aes = list(size = 3, shape = 16, alpha = 1)))
+
+  # --- Coord + theme ---
+  p <- p + coord_equal(clip = "off",
+                xlim = c(-16, 16), ylim = c(-16, 16)) +
+    theme_void(base_size = 11) +
+    theme(
+      legend.position    = "bottom",
+      legend.box         = "vertical",
+      legend.box.just    = "center",
+      legend.margin      = margin(0, 0, 0, 0),
+      legend.key.size    = unit(0.45, "cm"),
+      legend.key.width   = unit(1.0, "cm"),
+      legend.text        = element_text(size = 9),
+      legend.title       = element_text(size = 10, face = "bold"),
+      legend.box.spacing = unit(-1.5, "cm"),
+      legend.box.margin  = margin(0, 0, 10, 0),
+      plot.margin        = margin(0, 0, 0, 0)
+    ) +
+    guides(
+      shape = guide_legend(
+        order = 3, nrow = 1, title.position = "left",
+        override.aes = list(size = 4, stroke = 1, color = "black",
+                            fill = "white")
+      ), fill = "none")
+
+  if (!is.null(title) || !is.null(subtitle)) {
+    p <- p +
+      labs(title = title, subtitle = subtitle) +
+      theme(
+        plot.title    = element_text(face = "bold", size = 15, hjust = 0.5),
+        plot.subtitle = element_text(size = 9, hjust = 0.5, color = "gray40"))
+  }
+
+  p
+}
+
+
+# 11. GENERATE PLOTS
+p_main <- plot_network(
+  selected, edges, module_pos,
+  protein_df      = protein_df,
+  show_proteins   = TRUE,
+  show_all_labels = FALSE,
+  highlight_novel = TRUE
+)
+
+ggsave(file.path(OUTPUT_DIR, "network_fig3c.pdf"),
+       p_main, width = 8, height = 8)
+@
+
+<<>>=
+# 12. DIAGNOSTIC: PRINT SELECTED GENES BY CATEGORY
+cat("\n--- Opposing genes in final selection ---\n")
+opp <- selected %>% filter(category == "opposing") %>%
+  arrange(desc(primary_abs))
+cat(sprintf("%-14s %-6s %8s %8s %8s %8s %8s  sel_from\n",
+            "Gene", "Prim", "M1", "M2", "M3", "M4", "M5"))
+for (i in seq_len(nrow(opp))) {
+  g <- opp$gene[i]
+  cat(sprintf("%-14s %-6s %+.4f %+.4f %+.4f %+.4f %+.4f  %s\n",
+              g, opp$primary_module[i],
+              W[g, 1], W[g, 2], W[g, 3], W[g, 4], W[g, 5],
+              opp$selection[i]))
+}
+
+cat("\n--- Immune genes in final selection ---\n")
+imm <- selected %>% filter(is_immune) %>% arrange(primary_module, desc(primary_abs))
+cat(sprintf("%-14s %-6s %-10s %-10s %8s  sel_from\n",
+            "Gene", "Prim", "Category", "SecMod", "|W|max"))
+for (i in seq_len(nrow(imm))) {
+  cat(sprintf("%-14s %-6s %-10s %-10s %8.4f  %s\n",
+              imm$gene[i], imm$primary_module[i], imm$category[i],
+              ifelse(is.na(imm$secondary_module[i]), "-", imm$secondary_module[i]),
+              imm$primary_abs[i], imm$selection[i]))
+}
+
+cat("\n--- Novel genes in final selection ---\n")
+nov <- selected %>% filter(is_novel) %>% arrange(primary_module, desc(primary_abs))
+cat(sprintf("%-14s %-6s %-10s %8s  sel_from\n",
+            "Gene", "Prim", "Category", "|W|max"))
+for (i in seq_len(nrow(nov))) {
+  cat(sprintf("%-14s %-6s %-10s %8.4f  %s\n",
+              nov$gene[i], nov$primary_module[i], nov$category[i],
+              nov$primary_abs[i], nov$selection[i]))
+}
+@
+
+\end{document}

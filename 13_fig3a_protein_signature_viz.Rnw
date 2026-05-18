@@ -1,0 +1,252 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+Protein signature weights from semi-NMF (H matrix), L2-normalized to remove scale indeterminacy between W and H.
+
+Transposed Heatmap: Modules × Proteins (K=5, NTC Clusters, L2-Normalized)
+Replots the semi-NMF module loadings heatmap using:
+  - K=5 semi-NMF model (V1: Z-score, cis-masked)
+  - NTC-derived protein clusters (5 functional groups)
+  - NTC hierarchical clustering protein order
+  - L2 normalization transfer: removes scale indeterminacy so modules
+    are directly comparable
+
+Math: X ≈ WH = (W D^{-1})(D H) where D = diag(||W[:,m]||_2)
+      H_rescaled = D H preserves WH exactly, H stays non-negative
+      
+<<>>=
+suppressPackageStartupMessages({
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+# 1. LOAD DATA
+model_k5 <- readRDS("/home/ec2-user/scitoseq/results/semiNMF_v1_analysis/model_k5.rds")
+W5 <- model_k5$W  # 2848 genes × 5 modules
+H5 <- model_k5$H  # 5 modules × 201 proteins
+dim(W5)
+
+prot_cluster_df <- readRDS("/home/ec2-user/scitoseq/results/results_correlation/prot_cluster_df_ntc.rds")
+proteins_ordered <- readRDS("/home/ec2-user/scitoseq/results/results_correlation/protein_order_ntc.rds")
+
+cat(sprintf("W matrix: %d genes × %d modules\n", nrow(W5), ncol(W5)))
+cat(sprintf("H matrix: %d modules × %d proteins\n", nrow(H5), ncol(H5)))
+
+# 2. L2 NORMALIZATION TRANSFER
+# Transfer scale from W into H so modules are directly comparable.
+# d_m = ||W[:,m]||_2
+# H_rescaled[m,:] = d_m * H[m,:]
+# W_rescaled[:,m] = W[:,m] / d_m
+# Product W_rescaled %*% H_rescaled == W %*% H (exact)
+
+d <- sqrt(colSums(W5^2))  # L2 norm of each W column
+
+cat("\nW column L2 norms (source of scale indeterminacy):\n")
+for (m in 1:length(d)) {
+  cat(sprintf("  M%d: ||W[:,m]||_2 = %.3f\n", m, d[m]))
+}
+
+# Rescale
+H5_rescaled <- diag(d) %*% H5
+rownames(H5_rescaled) <- rownames(H5)
+colnames(H5_rescaled) <- colnames(H5)
+
+# Verify: reconstruction is identical
+cat("\nVerification (max |WH - W_rescaled H_rescaled|):\n")
+W5_rescaled <- W5 %*% diag(1/d)
+recon_diff <- max(abs(W5 %*% H5 - W5_rescaled %*% H5_rescaled))
+cat(sprintf("  %.2e (should be ~0)\n", recon_diff))
+
+# Compare H row ranges before and after
+cat("\nH row ranges BEFORE L2 normalization:\n")
+for (m in 1:nrow(H5)) {
+  cat(sprintf("  M%d: [%.3f, %.3f], mean=%.3f\n", m,
+              min(H5[m,]), max(H5[m,]), mean(H5[m,])))
+}
+
+cat("\nH row ranges AFTER L2 normalization:\n")
+for (m in 1:nrow(H5_rescaled)) {
+  cat(sprintf("  M%d: [%.3f, %.3f], mean=%.3f\n", m,
+              min(H5_rescaled[m,]), max(H5_rescaled[m,]), mean(H5_rescaled[m,])))
+}
+
+# Confirm H remains non-negative
+stopifnot(all(H5_rescaled >= 0))
+cat("\nConfirmed: H_rescaled remains non-negative.\n")
+
+# 3. PREPARE PLOT MATRIX
+rownames(H5_rescaled) <- paste0("M", 1:nrow(H5_rescaled))
+
+proteins_common <- intersect(proteins_ordered, colnames(H5_rescaled))
+proteins_missing <- setdiff(proteins_ordered, colnames(H5_rescaled))
+
+cat(sprintf("\nProteins in common: %d\n", length(proteins_common)))
+if (length(proteins_missing) > 0) {
+  cat(sprintf("Proteins in NTC order but not in H: %d\n", length(proteins_missing)))
+}
+
+H_plot <- matrix(
+  NA_real_, nrow = nrow(H5_rescaled), ncol = length(proteins_ordered),
+  dimnames = list(rownames(H5_rescaled), proteins_ordered)
+)
+H_plot[, proteins_common] <- H5_rescaled[, proteins_common, drop = FALSE]
+
+# 4. PROTEIN GROUP COLORS AND SPLIT
+cluster_colors <- c(
+  "Activation"         = "#d7aca1",
+  "Adhesion"           = "#79ad41",
+  "Cytokine/Chemokine" = "#4063a3",
+  "Identity"           = "#ddc000",
+  "Innate-like"        = "#34b6c6"
+)
+
+cluster_map <- setNames(prot_cluster_df$cluster_name, prot_cluster_df$protein)
+col_groups <- cluster_map[proteins_ordered]
+#col_groups[is.na(col_groups)] <- "Other"
+table(col_groups)
+#   Activation    Adhesion Cytokine/Chemokine       Identity        Innate-like 
+#      42             39                 39           24                 57 
+
+col_split <- factor(col_groups, levels = c(names(cluster_colors)))#, "Other"))
+
+# 5. COLOR PALETTES
+h_cap <- quantile(H_plot, probs = 0.99, na.rm = TRUE)
+if (!is.finite(h_cap) || h_cap <= 0) h_cap <- max(H_plot, na.rm = TRUE)
+cat(sprintf("\nColor cap (99th percentile): %.3f\n", h_cap))
+h_cap <- 60
+
+col_fun_viridis <- colorRamp2(
+  c(0, h_cap * 0.33, h_cap * 0.66, h_cap),
+  c("#440154", "#31688E", "#35B779", "#FDE725")
+)
+
+col_fun_mint <- colorRamp2(
+  c(0, h_cap * 0.5, h_cap),
+  c("#F7FCF5", "#66C2A4", "#00441B")
+)
+
+col_fun_purple_gold <- colorRamp2(
+  c(0, h_cap * 0.5, h_cap),
+  c("#F5F0E1", "#9970AB", "#5E3C99")
+)
+
+col_fun_grey <- colorRamp2(
+  c(0, h_cap * 0.5, h_cap),
+  c("#FFFFFF", "#969696", "#252525")
+)
+
+col_fun_ylgnbu <- colorRamp2(
+  c(0, h_cap * 0.25, h_cap * 0.5, h_cap * 0.75, h_cap),
+  c("#FFFFD9", "#C7E9B4", "#41B6C4", "#225EA8", "#081D58")
+)
+
+col_fun_inferno <- colorRamp2(
+  c(0, h_cap * 0.33, h_cap * 0.66, h_cap),
+  c("#000004", "#BC3754", "#F98C0A", "#FCFFA4")
+)
+
+# 6. HEATMAP FUNCTION
+create_module_heatmap <- function(
+    mat, col_fun, palette_name, col_split, col_groups,
+    cluster_colors, output_file = NULL, width = 8, height = 3
+) {
+  
+  all_colors <- cluster_colors
+  if ("Other" %in% levels(col_split)) {
+    all_colors <- c(all_colors, Other = "grey90")
+  }
+  
+  col_anno <- HeatmapAnnotation(
+    `Functional Group` = factor(col_groups, levels = names(all_colors)),
+    col = list(`Functional Group` = all_colors),
+    show_annotation_name = FALSE,
+    simple_anno_size = unit(4, "mm"),
+    annotation_legend_param = list(
+      `Functional Group` = list(
+        title = "Protein Group",
+        title_gp = gpar(fontsize = 11, fontface = "bold"),
+        labels_gp = gpar(fontsize = 11),
+        nrow = 1, title_position = "topcenter")))
+  
+  ht <- Heatmap(
+    mat, name = "Loading", col = col_fun, na_col = "#E6E6E6",
+    
+    cluster_rows = TRUE, cluster_columns = FALSE,
+    column_split = col_split, column_gap = unit(1.5, "mm"),
+    
+    row_names_side = "left",
+    row_names_gp = gpar(fontsize = 11, fontface = "bold"),
+    row_title = NULL,
+    
+    show_column_names = FALSE, column_title = NULL,
+    
+    top_annotation = col_anno,
+    
+    border = TRUE,
+    border_gp = gpar(col = "grey40", lwd = 0.5),
+    rect_gp = gpar(col = "white", lwd = 0.3),
+    
+    use_raster = TRUE, raster_quality = 4,
+    
+    heatmap_legend_param = list(
+      title = "Signature\nWeight", #"NMF\nLoading",
+      title_gp = gpar(fontsize = 11, fontface = "bold"),
+      labels_gp = gpar(fontsize = 11),
+      legend_height = unit(3, "cm"),
+      at = c(0, round(h_cap / 2, 2), round(h_cap, 2)),
+      border = "grey40"))
+  
+  if (!is.null(output_file)) {
+    pdf(output_file, width = width, height = height)
+    draw(
+      ht, heatmap_legend_side = "right",
+      annotation_legend_side = "bottom",
+      merge_legend = FALSE,
+      #column_title = paste0("Semi-NMF Module Loadings (k=5, L2-normalized, ", palette_name, ")"),
+      #column_title_gp = gpar(fontsize = 13, fontface = "bold")
+    )
+    dev.off()
+    message("Saved: ", output_file)
+  } else {
+    draw(
+      ht, heatmap_legend_side = "right",
+      annotation_legend_side = "bottom",
+      merge_legend = FALSE,
+      #column_title = paste0("Semi-NMF Module Loadings (k=5, L2-normalized, ", palette_name, ")"),
+      #column_title_gp = gpar(fontsize = 13, fontface = "bold")
+    )
+  }
+  
+  invisible(ht)
+}
+
+# 7. GENERATE ALL PLOTS
+out_dir <- "/home/ec2-user/scitoseq/fig/fig3/semiNMF_H"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+color_options <- list(
+  list(col_fun = col_fun_viridis,     name = "Viridis"),
+  list(col_fun = col_fun_mint,        name = "Mint-Teal"),
+  list(col_fun = col_fun_purple_gold, name = "Purple-Gold"),
+  list(col_fun = col_fun_grey,        name = "Greyscale"),
+  list(col_fun = col_fun_ylgnbu,      name = "YlGnBu"),
+  list(col_fun = col_fun_inferno,     name = "Inferno")
+)
+
+for (opt in color_options) {
+  filename <- file.path(
+    out_dir, paste0(
+      "semiNMF_k5_L2norm_modules_by_proteins_", gsub("-", "_", opt$name), ".pdf"))
+  
+  create_module_heatmap(
+    mat = H_plot, col_fun = opt$col_fun, palette_name = opt$name,
+    col_split = col_split, col_groups = col_groups,
+    cluster_colors = cluster_colors, output_file = filename,
+    width = 8, height = 3)
+}
+@
+
+\end{document}

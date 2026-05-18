@@ -1,0 +1,585 @@
+\documentclass{article}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+from 218_V4.Rnw
+
+Using Z-SCORE (not raw LFC) for heatmaps
+Rationale: Z-score is confidence-weighted, downweights noisy estimates from genes with few cells, consistent with Zhu et al. 2025
+
+Key design decisions:
+1. Uses Z-SCORE (not raw LFC) for P×G heatmaps - confidence-weighted,
+   consistent with Zhu et al. 2025
+2. Square cells in P×P heatmaps
+3. Explicit comparison of NTC vs LFC-derived P×P correlations
+
+<<>>=
+# COMPREHENSIVE CORRELATION ANALYSIS AND HEATMAP VISUALIZATION (v4)
+
+suppressPackageStartupMessages({
+  library(grid)
+  library(dplyr)
+  library(tidyr)
+  library(Matrix)
+  library(ggplot2)
+  library(circlize)
+  library(gridExtra)
+  library(RColorBrewer)
+  library(ComplexHeatmap)
+})
+
+set.seed(42)
+
+DATA_DIR <- "/home/ec2-user/scitoseq/data"
+RESULTS_DIR <- "/home/ec2-user/scitoseq/results/results_gene_level"
+OUTPUT_DIR <- "/home/ec2-user/scitoseq/results/results_correlation"
+
+# Parameters
+HEATMAP_SIG_FDR <- 0.10
+HEATMAP_Z_THRESHOLD <- 3
+ZSCORE_CAP <- 3#5            # Cap Z-scores for visualization
+N_PROTEIN_CLUSTERS <- 5
+
+# Cluster names and colors
+CLUSTER_NAMES <- c(
+  "1" = "Activation",
+  "2" = "Adhesion", 
+  "3" = "Cytokine/Chemokine",
+  "4" = "Identity",
+  "5" = "Innate-like"
+)
+
+cluster_colors <- c(
+  "Activation" = "#d7aca1",
+  "Adhesion" = "#79ad41",
+  "Cytokine/Chemokine" =  "#4063a3",
+  "Identity" = "#ddc000",
+  "Innate-like" = "#34b6c6"
+)
+# Isfahan2
+@
+
+<<>>=
+# SECTION 1: LOAD DATA
+
+# Load the deviance-normalized data for NTC correlation
+cat("Loading deviance-normalized data...\n")
+RAW_RDS <- file.path(DATA_DIR, "deviance_norm.rds")
+raw_data <- readRDS(RAW_RDS)
+
+# Clean protein names
+old_names <- rownames(raw_data)
+prefix_pat <- "^(anti-human-mouse-rat-|anti-mouse-human-|anti-human-mouse-|anti-human-|anti-mouse-|Mouse-|Rat-|ArmenianHamsterIgG-)"
+clean_names <- gsub(prefix_pat, "", old_names)
+clean_names <- gsub("-barcode\\d+$", "", clean_names)
+
+# Extract counts and metadata
+counts <- raw_data@assays$RNA@counts
+rownames(counts) <- clean_names
+meta <- raw_data@meta.data
+
+cat(sprintf("Data dimensions: %d proteins × %d cells\n", nrow(counts), ncol(counts)))
+
+rm(raw_data); gc()
+
+# Create clean guide columns
+meta$guide_target_clean <- ifelse(
+  grepl("NO-TARGET", meta$guide_target, ignore.case = TRUE),
+  "NTC", as.character(meta$guide_target))
+meta$guide_assignment_clean <- ifelse(
+  meta$guide_target_clean == "NTC", "NTC", as.character(meta$guide_assignment))
+
+# Remove IgE / IgLightChainL
+drop_feats <- c("IgE", "IgLightChainL")
+keep_rows <- !(rownames(counts) %in% drop_feats)
+counts <- counts[keep_rows, , drop = FALSE]
+
+all_proteins <- rownames(counts)
+n_proteins <- length(all_proteins)
+
+cat(sprintf("Proteins after QC: %d\n", n_proteins))
+
+# Load gene-level results
+cat("\nLoading gene-level analysis results...\n")
+gene_zscore_mat <- readRDS(file.path(RESULTS_DIR, "gene_zscore_mat.rds"))
+gene_ncells <- readRDS(file.path(RESULTS_DIR, "gene_ncells.rds"))
+@
+
+Gene matrices: 17336 genes × 201 proteins
+
+<<>>=
+# SECTION 2: NTC PROTEIN-PROTEIN CORRELATION
+
+# Extract NTC cells
+ntc_idx <- which(meta$guide_assignment_clean == "NTC")
+n_ntc <- length(ntc_idx)
+cat(sprintf("NTC cells: %d\n", n_ntc))
+# NTC cells: 26602
+
+# NTC expression matrix
+counts_ntc <- as.matrix(counts[, ntc_idx, drop = FALSE])
+
+# Compute NTC protein-protein correlation
+cat("Computing NTC protein-protein correlation...\n")
+prot_cor_ntc <- cor(t(counts_ntc), method = "pearson")
+
+rm(counts_ntc, counts); gc()
+
+# Summary
+ntc_upper <- prot_cor_ntc[upper.tri(prot_cor_ntc)]
+cat(sprintf("NTC correlation: mean=%.4f, median=%.4f, SD=%.4f\n",
+            mean(ntc_upper), median(ntc_upper), sd(ntc_upper)))
+
+
+# SECTION 3: HIERARCHICAL CLUSTERING OF PROTEINS (FROM NTC)
+prot_dist <- as.dist(1 - prot_cor_ntc)
+prot_hclust <- hclust(prot_dist, method = "ward.D2")
+prot_clusters_num <- cutree(prot_hclust, k = N_PROTEIN_CLUSTERS)
+
+# Protein order from hierarchical clustering
+proteins_ordered <- rownames(prot_cor_ntc)[prot_hclust$order]
+
+# Create cluster assignments
+prot_cluster_named <- sapply(prot_clusters_num, function(x) CLUSTER_NAMES[as.character(x)])
+names(prot_cluster_named) <- names(prot_clusters_num)
+
+prot_cluster_df <- data.frame(
+  protein = names(prot_clusters_num),
+  cluster_num = prot_clusters_num,
+  cluster_name = prot_cluster_named,
+  stringsAsFactors = FALSE
+)
+
+# Cluster order for annotations
+cluster_ordered <- prot_cluster_df$cluster_name[match(proteins_ordered, prot_cluster_df$protein)]
+
+cat("Protein clusters:\n")
+print(table(prot_cluster_df$cluster_name))
+# Activation    Adhesion Cytokine/Chemokine         Identity        Innate-like 
+#        42          39                 39                24                 57 
+                
+# saveRDS(prot_cluster_df, paste0(OUTPUT_DIR, "/prot_cluster_df_ntc.rds"))
+# print(paste0(OUTPUT_DIR, "/prot_cluster_df_ntc.rds"))
+# # "/home/ec2-user/scitoseq/results/results_correlation/prot_cluster_df_ntc.rds"
+head(prot_cluster_df)
+@
+      protein cluster_num       cluster_name
+CD86     CD86           1         Activation
+CD274   CD274           2           Adhesion
+CD273   CD273           2           Adhesion
+CD270   CD270           3 Cytokine/Chemokine
+CD47     CD47           4           Identity
+CD70     CD70           1         Activation
+
+<<>>=
+for (cl in CLUSTER_NAMES) {
+  prots <- prot_cluster_df$protein[prot_cluster_df$cluster_name == cl]
+  cat(sprintf("\n=== %s (n=%d) ===\n", cl, length(prots)))
+  cat(paste(sort(prots), collapse = ", "), "\n")
+}
+@
+
+=== Activation (n=42) ===
+B7-H4, C5L2, CD101, CD107a, CD134, CD137, CD151, CD152, CD154, CD162, CD186, CD194, CD2, CD223, CD226, CD25, CD257, CD26, CD278, CD3, CD314, CD317, CD35, CD45R-B220, CD45RA, CD49d, CD52, CD55, CD63, CD70, CD71, CD73, CD81, CD82, CD83, CD86, CD98, HLA-DQ, HLA-DR, HLA-DR-DP-DQ, integrinB7, TCR-Va7.2 
+
+=== Adhesion (n=39) ===
+CD10, CD102, CD105, CD11c, CD123, CD146, CD150, CD166, CD171, CD196, CD218a, CD273, CD274, CD31, CD319, CD321, CD33, CD36, CD43, CD45RB, CD49a, CD49b, CD5, CD58, CD62L, CD8, CD84, CD85j, CD9, CD90, CD96, CD99, EGFR, KLRG1, MERTK, MICA-MICB, Notch1, Notch2, TCR-Vd2 
+
+=== Cytokine/Chemokine (n=39) ===
+CD104, CD115, CD119, CD120b, CD124, CD138, CD144, CD158, CD158b, CD158d, CD178, CD183, CD195, CD197, CD198, CD199, CD23, CD244, CD254, CD267, CD269, CD270, CD279, CD294, CD307c-FcRL3, CD324, CD335, CD336, CD37, CD74, CX3CR1, GARP, LAP, Mac-2 , MR1, TCR-Vb13.1, TCR-Vr9, TCRrd, TSLPR 
+
+=== Identity (n=24) ===
+anti-CD230-Prion, CD109, CD11a, CD18, CD184, CD200, CD224, CD29, CD352, CD38, CD4, CD44, CD45, CD45RO, CD46, CD47, CD48, CD49f, CD54, CD59, CD69, CD95, GP130, HLA-ABC 
+
+=== Innate-like (n=57) ===
+CD103, CD106, CD117, CD11b, CD122, CD126, CD127, CD131, CD135, CD14, CD158e1, CD158f, CD16, CD161, CD185, CD192, CD193, CD1d, CD21, CD24, CD243, CD253, CD268, CD27, CD272, CD28, CD30, CD305, CD32, CD337, CD34, CD357, CD360, CD365, CD366, CD39, CD40, CD41, CD42b, CD56, CD57Recombinant, CD64, CD7, CD72, CD94, CLEC1B, FolateReceptorB, GPR56, HLA-A2, HLA-E, NKp80, Notch3, TCR-Va24-Ja18, TCRab, TIGIT, TIM-4, XCR1 
+
+<<>>=
+# SECTION 3: P×P NTC CORRELATION HEATMAP (SQUARE CELLS)
+
+# Correlation color scale (0 = white, symmetric around 0)
+cor_colors <- colorRamp2(
+  c(-0.5, -0.2, 0, 0.2, 0.5),
+  c("#2166AC", "#67A9CF", "white", "#EF8A62", "#B2182B")
+)
+
+zscore_colors <- colorRamp2(
+  c(-ZSCORE_CAP, -ZSCORE_CAP/2, 0, ZSCORE_CAP/2, ZSCORE_CAP),
+  c("#b08ba5",  "#c7a2b6", "white", "#ffb178", "#db8872")
+)
+#"#98768e", "#b08ba5", "#c7a2b6", "#dfbbc8", "#ffc680", "#ffb178", "#db8872", "#a56457"
+# Morgenstern
+
+# Reorder matrix
+prot_cor_ntc_ordered <- prot_cor_ntc[proteins_ordered, proteins_ordered]
+
+# Calculate cell size for square cells
+# For n proteins, we want width = height
+n_prot <- length(proteins_ordered)
+cell_size <- 1 # 0.6 #0.4  # mm per cell
+heatmap_size <- n_prot * cell_size / 10  # convert to cm
+
+cat(sprintf("Heatmap size: %.1f cm × %.1f cm (%.1f mm per cell)\n", 
+            heatmap_size, heatmap_size, cell_size))
+
+# Row annotation
+row_anno_pxp <- rowAnnotation(
+  Group = cluster_ordered,
+  col = list(Group = cluster_colors),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(4, "mm"),#unit(3, "mm"),
+  show_legend = FALSE
+)
+
+# Column annotation
+col_anno_pxp <- HeatmapAnnotation(
+  Group = cluster_ordered,
+  col = list(Group = cluster_colors),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(3, "mm"),
+  annotation_legend_param = list(
+    Group = list(
+      title = "Protein Group",
+      title_gp = gpar(fontsize = 12, fontface = "bold"),
+      labels_gp = gpar(fontsize = 11)
+    )
+  )
+)
+
+cat("Generating NTC P×P correlation heatmap...\n")
+fig_dir <- "/home/ec2-user/scitoseq/fig/fig2/"
+pdf(file.path(fig_dir, "pxp_ntc_correlation_square.pdf"), width = 10, height = 10)
+
+ht_ntc <- Heatmap(
+  prot_cor_ntc_ordered,
+  name = "Correlation",
+  col = cor_colors,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  left_annotation = row_anno_pxp,
+  top_annotation = col_anno_pxp,
+  
+  show_row_names = FALSE,#TRUE,
+  show_column_names = FALSE,#TRUE,
+  row_names_gp = gpar(fontsize = 4),
+  column_names_gp = gpar(fontsize = 4),
+  column_names_rot = 90,
+  
+  column_title = sprintf("Protein-Protein Correlation (NTC, n=%s)", format(n_ntc, big.mark=",")),
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  
+  heatmap_legend_param = list(
+    title = "Pearson\nCorrelation",
+    title_gp = gpar(fontsize = 9, fontface = "bold"),
+    legend_height = unit(3, "cm"),
+    at = c(-0.4, -0.2, 0, 0.2, 0.4, 0.8)
+  ),
+  
+  # Square cells: equal width and height
+  width = unit(heatmap_size, "cm"),
+  height = unit(heatmap_size, "cm"),
+  
+  border = TRUE,
+  border_gp = gpar(col = "gray40", lwd = 0.5),
+  rect_gp = gpar(col = NA)
+)
+
+draw(ht_ntc, merge_legend = TRUE)
+dev.off()
+
+# # PNG
+# png(file.path(OUTPUT_DIR, "pxp_ntc_correlation_square.png"), 
+#     width = 10, height = 10, units = "in", res = 300)
+# draw(ht_ntc, merge_legend = TRUE)
+# dev.off()
+@
+
+<<>>=
+# Between-group and within-group mean correlations from NTC P×P matrix
+
+# Build a matrix of group-level mean correlations
+groups <- unique(prot_cluster_df$cluster_name)
+n_groups <- length(groups)
+
+group_cor_mat <- matrix(NA, nrow = n_groups, ncol = n_groups,
+                        dimnames = list(groups, groups))
+
+for (i in seq_along(groups)) {
+  for (j in seq_along(groups)) {
+    prots_i <- prot_cluster_df$protein[prot_cluster_df$cluster_name == groups[i]]
+    prots_j <- prot_cluster_df$protein[prot_cluster_df$cluster_name == groups[j]]
+    
+    sub_mat <- prot_cor_ntc[prots_i, prots_j, drop = FALSE]
+    
+    if (i == j) {
+      # Within-group: use upper triangle only (exclude diagonal = 1)
+      vals <- sub_mat[upper.tri(sub_mat)]
+    } else {
+      # Between-group: use all entries
+      vals <- as.vector(sub_mat)
+    }
+    
+    group_cor_mat[i, j] <- mean(vals, na.rm = TRUE)
+  }
+}
+
+cat("=== Group-level mean Pearson correlations (NTC) ===\n\n")
+print(round(group_cor_mat, 4))
+@
+                   Activation Adhesion Cytokine/Chemokine Identity Innate-like
+Activation             0.2304   0.1125             0.0227   0.2129      0.0576
+Adhesion               0.1125   0.1037             0.0426   0.1628      0.0656
+Cytokine/Chemokine     0.0227   0.0426             0.1486  -0.0044      0.0610
+Identity               0.2129   0.1628            -0.0044   0.3837      0.0435
+Innate-like            0.0576   0.0656             0.0610   0.0435      0.0812
+
+<<>>=
+# Tidy long-format table for easy reading
+group_cor_long <- expand.grid(
+  Group1 = groups, Group2 = groups, stringsAsFactors = FALSE) %>% rowwise() %>%
+  mutate(
+    mean_cor = group_cor_mat[Group1, Group2],
+    type = ifelse(Group1 == Group2, "within", "between")
+  ) %>% ungroup() %>% arrange(desc(type), desc(mean_cor))
+
+cat("\n=== Within-group mean correlations ===\n")
+group_cor_long %>% filter(type == "within") %>%  
+  select(Group = Group1, mean_cor) %>% arrange(desc(mean_cor)) %>%
+  print(n = Inf)
+@
+# A tibble: 5 × 2
+  Group              mean_cor
+  <chr>                 <dbl>
+1 Identity             0.384 
+2 Activation           0.230 
+3 Cytokine/Chemokine   0.149 
+4 Adhesion             0.104 
+5 Innate-like          0.0812
+
+<<>>=
+cat("\n=== Between-group mean correlations (unique pairs) ===\n")
+group_cor_long %>% filter(type == "between") %>% rowwise() %>%
+  mutate(pair = paste(sort(c(Group1, Group2)), collapse = " — ")) %>%
+  ungroup() %>% distinct(pair, .keep_all = TRUE) %>%
+  select(pair, mean_cor) %>% arrange(desc(mean_cor)) %>%
+  print(n = Inf)
+
+group_cor_ordered <- group_cor_mat[CLUSTER_NAMES, CLUSTER_NAMES]
+print(round(group_cor_ordered, 3))
+@
+
+                   Activation Adhesion Cytokine/Chemokine Identity Innate-like
+Activation              0.230    0.113              0.023    0.213       0.058
+Adhesion                0.113    0.104              0.043    0.163       0.066
+Cytokine/Chemokine      0.023    0.043              0.149   -0.004       0.061
+Identity                0.213    0.163             -0.004    0.384       0.043
+Innate-like             0.058    0.066              0.061    0.043       0.081
+
+<<>>=
+# SECTION 4: PREPARE HEATMAP COMPONENTS
+
+results_dir <- "/home/ec2-user/scitoseq/results/results_gene_level"
+FDR_VERSION <- "per_protein"
+if (FDR_VERSION == "global") {
+  gene_qval_mat <- readRDS(file.path(results_dir, "gene_qval_mat.rds"))
+  cat("Using GLOBAL FDR (BH across 3.5M tests) - most conservative\n")
+} else if (FDR_VERSION == "per_protein") {
+  # FIXED: per-protein FDR is in CORR_DIR
+  gene_qval_mat <- readRDS(file.path(results_dir, "gene_qval_per_protein.rds"))
+  cat("Using PER-PROTEIN FDR (BH across 17K genes per protein)\n")
+} else if (FDR_VERSION == "per_gene") {
+  # FIXED: per-gene FDR is in CORR_DIR
+  gene_qval_mat <- readRDS(file.path(results_dir, "gene_qval_per_gene.rds"))
+  cat("WARNING: Using PER-GENE FDR (only 201 tests per gene) - may inflate false positives!\n")
+}
+
+# Significant genes
+HEATMAP_SIG_FDR <- 0.10
+sig_genes_fdr <- unique(which(gene_qval_mat < HEATMAP_SIG_FDR, arr.ind = TRUE)[, 1])
+sig_gene_names_fdr <- rownames(gene_zscore_mat)[sig_genes_fdr]
+length(sig_gene_names_fdr)# 2848
+
+# Genes with at least one FDR < 0.10 (for P×P correlation)
+genes_with_any_sig <- rownames(gene_qval_mat)[sig_genes_fdr]
+cat(sprintf("Genes with at least one GLOBAL FDR < %.2f: %d\n", HEATMAP_SIG_FDR, length(genes_with_any_sig)))
+# # Genes with at least one FDR < 0.10: 2848
+
+# Reorder NTC correlation matrix
+prot_cor_ntc_ordered <- prot_cor_ntc[proteins_ordered, proteins_ordered]
+
+# Row annotation for combined heatmaps
+row_anno_combined <- rowAnnotation(
+  Group = cluster_ordered,
+  col = list(Group = cluster_colors),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(3, "mm"),
+  annotation_legend_param = list(
+    Group = list(title = "Functional\nGroup")
+  )
+)
+
+# NTC heatmap (left panel, same for all)
+ht_ntc_combined <- Heatmap(
+  prot_cor_ntc_ordered,
+  name = "Correlation",
+  col = cor_colors,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  
+  column_title = "P×P Correlation\n(NTC)",
+  column_title_gp = gpar(fontsize = 10, fontface = "bold"),
+  
+  heatmap_legend_param = list(
+    title = "Pearson\nCorrelation",
+    legend_height = unit(3, "cm"),
+    at = c(-0.4, 0, 0.4, 0.8)),
+  
+  width = unit(9, "cm"),
+  height = unit(9, "cm"),
+  
+  border = TRUE,
+  rect_gp = gpar(col = NA)
+)
+
+# SECTION 5: HEATMAP WITH PER-PROTEIN FDR SELECTION
+
+# Select genes with at least one FDR < 0.10 (per-protein)
+FDR_THRESHOLD <- 0.1
+cat(sprintf("Selecting genes with ≥1 protein at per-protein FDR < %.2f...\n", FDR_THRESHOLD))
+
+genes_sig_per_protein <- rownames(gene_qval_mat)[rowSums(gene_qval_mat < FDR_THRESHOLD, na.rm = TRUE) >= 1]
+cat(sprintf("Number of genes: %d\n", length(genes_sig_per_protein)))
+# Number of genes: 2848
+
+# Prepare Z-score matrix for these genes
+zscore_per_protein <- t(gene_zscore_mat[genes_sig_per_protein, , drop = FALSE])
+zscore_per_protein_ordered <- zscore_per_protein[proteins_ordered, , drop = FALSE]
+
+# Cluster genes
+zscore_for_clust <- t(zscore_per_protein_ordered)
+zscore_for_clust[is.na(zscore_for_clust)] <- 0
+gene_hclust_per_protein <- hclust(dist(zscore_for_clust), method = "ward.D2")
+genes_ordered_per_protein <- colnames(zscore_per_protein_ordered)[gene_hclust_per_protein$order]
+zscore_per_protein_final <- zscore_per_protein_ordered[, genes_ordered_per_protein]
+
+# Cap Z-scores
+zscore_per_protein_capped <- pmax(pmin(zscore_per_protein_final, ZSCORE_CAP), -ZSCORE_CAP)
+
+cat(sprintf("Per-protein FDR Z-score matrix: %d proteins × %d genes\n", 
+            nrow(zscore_per_protein_capped), ncol(zscore_per_protein_capped)))
+
+
+# Key proteins to label (3-5 per module)
+# key_proteins <- c(
+#   "CD25", "CD134", "CD137", "HLA-DR", "CD71",
+#   "CD62L", "CD274", "Notch1", "KLRG1",
+#   "CD183", "CD197", "CD279", "CX3CR1", "GARP",
+#   "CD4", "CD45", "HLA-ABC", "CD29", "CD47",
+#   "CD56", "CD161", "TIGIT", "CD366", "CD28"
+# )
+key_proteins <- c(
+  # Identity
+  "CD4", "CD45", "CD47", "CD29",
+  # Activation
+  "CD25", "CD134", "CD137", "CD71",
+  # Cytokine/Chemokine
+  "CD183", "CD197", "CD279", "GARP",
+  # Adhesion
+  "CD62L", "CD31", "KLRG1", "Notch1",
+  # Innate-like
+  "CD56", "CD161", "TIGIT", "CD366"
+)
+
+# # Indices in the ordered protein list (rows of the heatmap)
+# mark_idx <- which(proteins_ordered %in% key_proteins)
+# mark_labels <- proteins_ordered[mark_idx]
+# 
+# right_anno_mark <- rowAnnotation(
+#   mark = anno_mark(
+#     at = mark_idx,
+#     labels = mark_labels,
+#     labels_gp = gpar(fontsize = 7),
+#     link_width = unit(5, "mm"),
+#     link_gp = gpar(col = "gray50", lwd = 0.5)
+#   )
+# )
+# Get cluster color for each labeled protein
+mark_idx <- which(proteins_ordered %in% key_proteins)
+mark_labels <- proteins_ordered[mark_idx]
+mark_cluster <- prot_cluster_df$cluster_name[match(mark_labels, prot_cluster_df$protein)]
+mark_colors <- cluster_colors[mark_cluster]
+
+right_anno_mark <- rowAnnotation(
+  mark = anno_mark(
+    at = mark_idx, labels = mark_labels,
+    labels_gp = gpar(fontsize = 7, col = mark_colors, fontface = "bold"),
+    link_width = unit(5, "mm"),
+    link_gp = gpar(col = "gray50", lwd = 0.5)))
+
+# Create right panel heatmap
+ht_zscore_per_protein <- Heatmap(
+  zscore_per_protein_capped,
+  name = "Z-score",
+  col = zscore_colors,
+  
+  right_annotation = right_anno_mark,
+  
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  
+  column_title = sprintf("P×G Perturbation Z-scores\n(%d Genes: Per-Protein FDR<%.2f)", 
+                         length(genes_sig_per_protein), FDR_THRESHOLD),
+  column_title_gp = gpar(fontsize = 10, fontface = "bold"),
+  
+  heatmap_legend_param = list(
+    title = "Z-score",
+    legend_height = unit(3, "cm"),
+    at = c(-ZSCORE_CAP, 0, ZSCORE_CAP),
+    labels = c(sprintf("≤%.0f", -ZSCORE_CAP), "0", sprintf("≥%.0f", ZSCORE_CAP))
+  ),
+  
+  use_raster = TRUE,
+  raster_quality = 3,
+  
+  width = unit(20, "cm"),#16, "cm"),
+  height = unit(9, "cm"),
+  
+  border = TRUE,
+  rect_gp = gpar(col = NA)
+)
+
+cat("Generating combined heatmap (NTC + per-protein FDR genes)...\n")
+
+pdf(file.path(fig_dir, "combined_ntc_zscore_perprotein_fdr3.pdf"), width = 20, height = 9)#16, height = 9)
+
+draw(row_anno_combined + ht_ntc_combined + ht_zscore_per_protein,
+     merge_legend = TRUE,
+     heatmap_legend_side = "right",
+     annotation_legend_side = "right",
+     column_title = "Protein Co-expression (NTC) vs Perturbation Response Z-scores (Per-Protein FDR)",
+     column_title_gp = gpar(fontsize = 13, fontface = "bold"))
+
+dev.off()
+
+# png(file.path(OUTPUT_DIR, "combined_ntc_zscore_perprotein_fdr.png"), 
+#     width = 20, height = 9, units = "in", res = 300)
+# draw(row_anno_combined + ht_ntc_combined + ht_zscore_per_protein,
+#      merge_legend = TRUE,
+#      heatmap_legend_side = "right",
+#      annotation_legend_side = "right",
+#      column_title = "Protein Co-expression (NTC) vs Perturbation Response Z-scores (Per-Protein FDR)",
+#      column_title_gp = gpar(fontsize = 13, fontface = "bold"))
+# dev.off()
+@
+
+\end{document}
